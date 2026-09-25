@@ -1,0 +1,17 @@
+# Web API
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.34,<1.0
+python-multipart>=0.0.20,<1.0
+
+# Database
+SQLAlchemy>=2.0,<3.0
+psycopg[binary]>=3.2,<4.0
+
+# Configuration
+pydantic-settings>=2.7,<3.0
+
+# HTTP client
+httpx>=0.28,<1.0
+
+# Testing
+pytest>=8.3,<9.0
