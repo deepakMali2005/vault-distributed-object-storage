@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.git/
+.gitignore
+.env
+*.pyc
+*.pyo
+*.log
+data/
+test-object.txt
+retrieved.txt

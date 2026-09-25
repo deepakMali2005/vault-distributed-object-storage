@@ -1,0 +1,1 @@
+"""VAULT coordinator service."""

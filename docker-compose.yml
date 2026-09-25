@@ -1,0 +1,62 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: vault-postgres
+    environment:
+      POSTGRES_USER: vault
+      POSTGRES_PASSWORD: vault
+      POSTGRES_DB: vault
+    ports:
+      - "5433:5432"
+    volumes:
+      - vault_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vault -d vault"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  storage-node:
+    build: .
+    container_name: vault-storage-node
+    command: uvicorn storage_node.main:app --host 0.0.0.0 --port 8100
+    environment:
+      STORAGE_NODE_HOST: 0.0.0.0
+      STORAGE_NODE_PORT: 8100
+      STORAGE_NODE_DATA_DIR: /data/storage-node
+    ports:
+      - "8100:8100"
+    volumes:
+      - vault_storage_data:/data/storage-node
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8100/health')",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  coordinator:
+    build: .
+    container_name: vault-coordinator
+    command: uvicorn coordinator.main:app --host 0.0.0.0 --port 8000
+    environment:
+      COORDINATOR_HOST: 0.0.0.0
+      COORDINATOR_PORT: 8000
+      DATABASE_URL: postgresql+psycopg://vault:vault@postgres:5432/vault
+      STORAGE_NODE_URL: http://storage-node:8100
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      storage-node:
+        condition: service_healthy
+
+volumes:
+  vault_postgres_data:
+  vault_storage_data:
