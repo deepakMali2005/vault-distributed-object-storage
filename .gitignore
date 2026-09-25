@@ -63,3 +63,7 @@ node_modules/
 .next/
 planned_things.txt
 run_scripts.txt
+
+# Local test files
+test-object.txt
+retrieved.txt
