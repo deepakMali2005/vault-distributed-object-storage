@@ -29,6 +29,14 @@ class CoordinatorSettings(BaseSettings):
             "COORDINATOR_STORAGE_NODE_URL",
         ),
     )
+    replication_factor: int = Field(
+        default=3,
+        validation_alias=AliasChoices(
+            "REPLICATION_FACTOR",
+            "COORDINATOR_REPLICATION_FACTOR",
+        ),
+        ge=1,
+    )
     storage_nodes: str = Field(
         default="http://localhost:8100",
         validation_alias=AliasChoices(

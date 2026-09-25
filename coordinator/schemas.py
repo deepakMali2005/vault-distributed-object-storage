@@ -44,3 +44,21 @@ class StorageNodeListResponse(BaseModel):
     """Response containing registered storage nodes."""
 
     nodes: list[StorageNodeResponse]
+
+class ObjectReplicaResponse(BaseModel):
+    """Internal metadata describing one object replica."""
+
+    replica_id: UUID
+    object_id: UUID
+    node_id: UUID
+    state: str
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ObjectReplicaListResponse(BaseModel):
+    """Response containing replica metadata for an object."""
+
+    replicas: list[ObjectReplicaResponse]

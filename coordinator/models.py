@@ -3,7 +3,15 @@
 from datetime import datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import BigInteger, DateTime, String, Uuid, func
+from sqlalchemy import (
+    BigInteger,
+    DateTime,
+    ForeignKey,
+    String,
+    UniqueConstraint,
+    Uuid,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from coordinator.db import Base
@@ -88,6 +96,59 @@ class StorageNode(Base):
     used_bytes: Mapped[int | None] = mapped_column(
         BigInteger,
         nullable=True,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class ObjectReplica(Base):
+    """Metadata describing one planned replica of an object."""
+
+    __tablename__ = "object_replicas"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "object_id",
+            "node_id",
+            name="uq_object_replica",
+        ),
+    )
+
+    replica_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        primary_key=True,
+        default=uuid4,
+    )
+
+    object_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("objects.object_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    node_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("storage_nodes.node_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    state: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="PENDING",
     )
 
     created_at: Mapped[datetime] = mapped_column(

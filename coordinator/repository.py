@@ -5,7 +5,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from coordinator.models import ObjectMetadata, StorageNode
+from coordinator.models import ObjectMetadata, ObjectReplica, StorageNode
 
 
 class ObjectNotFoundError(Exception):
@@ -126,6 +126,7 @@ class StorageNodeRepository:
             .where(StorageNode.status == "ACTIVE")
             .order_by(StorageNode.name)
         )
+
         return list(self.db.scalars(statement).all())
 
     def get_by_id(self, node_id: UUID) -> StorageNode:
@@ -135,3 +136,59 @@ class StorageNodeRepository:
             raise StorageNodeNotFoundError(node_id)
 
         return node
+
+
+class ObjectReplicaRepository:
+    """Provides persistence operations for object-replica metadata."""
+
+    def __init__(self, db: Session) -> None:
+        self.db = db
+
+    def create(
+        self,
+        *,
+        object_id: UUID,
+        node_id: UUID,
+        state: str = "PENDING",
+    ) -> ObjectReplica:
+        replica = ObjectReplica(
+            object_id=object_id,
+            node_id=node_id,
+            state=state,
+        )
+
+        self.db.add(replica)
+        self.db.commit()
+        self.db.refresh(replica)
+
+        return replica
+
+    def list_for_object(self, object_id: UUID) -> list[ObjectReplica]:
+        statement = (
+            select(ObjectReplica)
+            .where(ObjectReplica.object_id == object_id)
+            .order_by(
+                ObjectReplica.created_at,
+                ObjectReplica.replica_id,
+            )
+        )
+
+        return list(self.db.scalars(statement).all())
+
+    def list_active_for_object(
+        self,
+        object_id: UUID,
+    ) -> list[ObjectReplica]:
+        statement = (
+            select(ObjectReplica)
+            .where(
+                ObjectReplica.object_id == object_id,
+                ObjectReplica.state == "ACTIVE",
+            )
+            .order_by(
+                ObjectReplica.created_at,
+                ObjectReplica.replica_id,
+            )
+        )
+
+        return list(self.db.scalars(statement).all())
