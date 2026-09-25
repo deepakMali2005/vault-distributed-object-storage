@@ -29,11 +29,27 @@ class CoordinatorSettings(BaseSettings):
             "COORDINATOR_STORAGE_NODE_URL",
         ),
     )
+    storage_nodes: str = Field(
+        default="http://localhost:8100",
+        validation_alias=AliasChoices(
+            "STORAGE_NODES",
+            "COORDINATOR_STORAGE_NODES",
+        ),
+    )
 
     model_config = SettingsConfigDict(
         env_file=".env",
         extra="ignore",
     )
+
+    def configured_storage_nodes(self) -> list[str]:
+        """Return configured storage-node URLs in stable order."""
+
+        return [
+            url.strip().rstrip("/")
+            for url in self.storage_nodes.split(",")
+            if url.strip()
+        ]
 
 
 settings = CoordinatorSettings()

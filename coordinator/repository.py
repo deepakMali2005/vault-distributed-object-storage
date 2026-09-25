@@ -1,15 +1,19 @@
-"""Metadata repository for the VAULT coordinator."""
+"""Metadata repositories for the VAULT coordinator."""
 
 from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from coordinator.models import ObjectMetadata
+from coordinator.models import ObjectMetadata, StorageNode
 
 
 class ObjectNotFoundError(Exception):
     """Raised when object metadata does not exist."""
+
+
+class StorageNodeNotFoundError(Exception):
+    """Raised when storage-node metadata does not exist."""
 
 
 class ObjectRepository:
@@ -72,3 +76,62 @@ class ObjectRepository:
 
         self.db.delete(metadata)
         self.db.commit()
+
+
+class StorageNodeRepository:
+    """Provides persistence operations for storage-node metadata."""
+
+    def __init__(self, db: Session) -> None:
+        self.db = db
+
+    def upsert(
+        self,
+        *,
+        name: str,
+        url: str,
+        status: str = "ACTIVE",
+        capacity_bytes: int | None = None,
+        used_bytes: int | None = None,
+    ) -> StorageNode:
+        statement = select(StorageNode).where(StorageNode.url == url)
+        node = self.db.scalar(statement)
+
+        if node is None:
+            node = StorageNode(
+                name=name,
+                url=url,
+                status=status,
+                capacity_bytes=capacity_bytes,
+                used_bytes=used_bytes,
+            )
+            self.db.add(node)
+        else:
+            node.name = name
+            node.status = status
+            node.capacity_bytes = capacity_bytes
+            node.used_bytes = used_bytes
+
+        self.db.commit()
+        self.db.refresh(node)
+
+        return node
+
+    def list_all(self) -> list[StorageNode]:
+        statement = select(StorageNode).order_by(StorageNode.name)
+        return list(self.db.scalars(statement).all())
+
+    def list_active(self) -> list[StorageNode]:
+        statement = (
+            select(StorageNode)
+            .where(StorageNode.status == "ACTIVE")
+            .order_by(StorageNode.name)
+        )
+        return list(self.db.scalars(statement).all())
+
+    def get_by_id(self, node_id: UUID) -> StorageNode:
+        node = self.db.get(StorageNode, node_id)
+
+        if node is None:
+            raise StorageNodeNotFoundError(node_id)
+
+        return node

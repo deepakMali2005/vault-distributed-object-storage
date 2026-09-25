@@ -11,8 +11,17 @@ from sqlalchemy.orm import Session
 
 from coordinator.config import settings
 from coordinator.db import get_db, init_db
-from coordinator.repository import ObjectNotFoundError, ObjectRepository
-from coordinator.schemas import ObjectListResponse, ObjectMetadataResponse
+from coordinator.repository import (
+    ObjectNotFoundError,
+    ObjectRepository,
+    StorageNodeRepository,
+)
+from coordinator.schemas import (
+    ObjectListResponse,
+    ObjectMetadataResponse,
+    StorageNodeListResponse,
+    StorageNodeResponse,
+)
 from coordinator.storage_client import StorageNodeClient, StorageNodeError
 
 
@@ -21,6 +30,20 @@ async def lifespan(_app: FastAPI):
     """Initialize coordinator infrastructure when the service starts."""
 
     init_db()
+
+    db = next(get_db())
+    try:
+        repository = StorageNodeRepository(db)
+
+        for index, url in enumerate(settings.configured_storage_nodes(), start=1):
+            repository.upsert(
+                name=f"storage-node-{index}",
+                url=url,
+                status="ACTIVE",
+            )
+    finally:
+        db.close()
+
     yield
 
 
@@ -224,5 +247,28 @@ def list_objects(
         objects=[
             ObjectMetadataResponse.model_validate(obj)
             for obj in repository.list_all()
+        ]
+    )
+
+
+@app.get(
+    "/internal/storage-nodes",
+    response_model=StorageNodeListResponse,
+)
+def list_storage_nodes(
+    db: Session = Depends(get_db),
+) -> StorageNodeListResponse:
+    """Return storage nodes known to the coordinator.
+
+    This is an internal control-plane endpoint, not part of the public
+    object-storage API.
+    """
+
+    repository = StorageNodeRepository(db)
+
+    return StorageNodeListResponse(
+        nodes=[
+            StorageNodeResponse.model_validate(node)
+            for node in repository.list_all()
         ]
     )

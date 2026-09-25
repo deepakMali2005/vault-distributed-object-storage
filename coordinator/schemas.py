@@ -23,3 +23,24 @@ class ObjectListResponse(BaseModel):
     """Response containing stored object metadata."""
 
     objects: list[ObjectMetadataResponse]
+
+
+class StorageNodeResponse(BaseModel):
+    """Internal metadata describing a registered storage node."""
+
+    node_id: UUID
+    name: str
+    url: str
+    status: str
+    capacity_bytes: int | None
+    used_bytes: int | None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class StorageNodeListResponse(BaseModel):
+    """Response containing registered storage nodes."""
+
+    nodes: list[StorageNodeResponse]
