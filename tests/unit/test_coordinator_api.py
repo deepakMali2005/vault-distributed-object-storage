@@ -35,6 +35,8 @@ class FakeStorageNodeClient:
     objects_by_node: dict[str, dict[UUID, bytes]] = {}
     failed_urls: set[str] = set()
     get_failed_urls: set[str] = set()
+    invalid_json_urls: set[str] = set()
+    wrong_object_id_urls: set[str] = set()
 
     def __init__(self, base_url: str) -> None:
         self.base_url = base_url.rstrip("/")
@@ -61,6 +63,9 @@ class FakeStorageNodeClient:
     ):
         self._raise_if_failed("PUT")
 
+        if self.base_url in self.invalid_json_urls:
+            raise StorageNodeError("simulated invalid storage-node response")
+
         payload = file.read()
 
         self.objects_by_node[
@@ -69,8 +74,13 @@ class FakeStorageNodeClient:
 
         import hashlib
 
+        response_object_id = object_id
+
+        if self.base_url in self.wrong_object_id_urls:
+            response_object_id = UUID("00000000-0000-0000-0000-000000000001")
+
         return {
-            "object_id": str(object_id),
+            "object_id": str(response_object_id),
             "size": len(payload),
             "checksum": hashlib.sha256(
                 payload
@@ -201,6 +211,8 @@ def create_test_client(monkeypatch):
     FakeStorageNodeClient.objects_by_node = {}
     FakeStorageNodeClient.failed_urls = set()
     FakeStorageNodeClient.get_failed_urls = set()
+    FakeStorageNodeClient.invalid_json_urls = set()
+    FakeStorageNodeClient.wrong_object_id_urls = set()
 
     return TestClient(main.app), engine
 
@@ -593,6 +605,69 @@ def test_delete_attempts_all_replica_records_not_only_active_records(monkeypatch
             f"/internal/objects/{object_id}/replicas"
         )
         assert replica_response.json()["replicas"] == []
+
+    finally:
+        main.app.dependency_overrides.clear()
+        engine.dispose()
+
+
+def test_replication_rejects_storage_node_response_for_wrong_object(monkeypatch):
+    client, engine = create_test_client(monkeypatch)
+    payload = b"wrong object id"
+
+    FakeStorageNodeClient.wrong_object_id_urls = {
+        "http://test-storage-1"
+    }
+
+    try:
+        response = client.put(
+            "/objects/demo/wrong-object-id.txt",
+            files={"file": ("object.txt", payload)},
+        )
+
+        assert response.status_code == 502
+        assert response.json()["detail"] == (
+            "Object replication failed: 2/3 replicas persisted"
+        )
+
+        object_id = UUID(
+            client.get("/objects").json()["objects"][0]["object_id"]
+        )
+
+        replica_response = client.get(
+            f"/internal/objects/{object_id}/replicas"
+        )
+        states = [
+            replica["state"]
+            for replica in replica_response.json()["replicas"]
+        ]
+
+        assert states.count("ACTIVE") == 2
+        assert states.count("FAILED") == 1
+
+    finally:
+        main.app.dependency_overrides.clear()
+        engine.dispose()
+
+
+def test_replication_handles_storage_node_response_failure(monkeypatch):
+    client, engine = create_test_client(monkeypatch)
+    payload = b"invalid response"
+
+    FakeStorageNodeClient.invalid_json_urls = {
+        "http://test-storage-2"
+    }
+
+    try:
+        response = client.put(
+            "/objects/demo/invalid-response.txt",
+            files={"file": ("object.txt", payload)},
+        )
+
+        assert response.status_code == 502
+        assert response.json()["detail"] == (
+            "Object replication failed: 2/3 replicas persisted"
+        )
 
     finally:
         main.app.dependency_overrides.clear()

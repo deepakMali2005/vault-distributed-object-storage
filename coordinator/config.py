@@ -53,11 +53,19 @@ class CoordinatorSettings(BaseSettings):
     def configured_storage_nodes(self) -> list[str]:
         """Return configured storage-node URLs in stable order."""
 
-        return [
+        nodes = [
             url.strip().rstrip("/")
             for url in self.storage_nodes.split(",")
             if url.strip()
         ]
+
+        if not nodes:
+            raise ValueError("At least one storage node must be configured")
+
+        if len(nodes) != len(set(nodes)):
+            raise ValueError("Storage node URLs must be unique")
+
+        return nodes
 
 
 settings = CoordinatorSettings()

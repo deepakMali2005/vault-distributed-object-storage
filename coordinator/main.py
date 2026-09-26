@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, status
 from fastapi.responses import Response, StreamingResponse
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from coordinator.config import settings
@@ -125,7 +126,8 @@ def _write_replicas(
             )
 
             if (
-                result.get("size") != expected_size
+                result.get("object_id") != str(object_id)
+                or result.get("size") != expected_size
                 or result.get("checksum") != expected_checksum
             ):
                 raise StorageNodeError(
@@ -318,12 +320,19 @@ def put_object(
         file.file.close()
 
     try:
-        metadata = object_repository.create(
-            object_id=object_id,
-            object_key=object_key,
-            size=size,
-            checksum=checksum,
-        )
+        try:
+            metadata = object_repository.create(
+                object_id=object_id,
+                object_key=object_key,
+                size=size,
+                checksum=checksum,
+            )
+        except IntegrityError as exc:
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="Object key already exists",
+            ) from exc
 
         replica_records = replica_repository.create_many(
             object_id=object_id,
@@ -501,8 +510,6 @@ def delete_object(
 
         except StorageNodeError as exc:
             if exc.status_code == 404:
-                # The physical copy is already absent, so the replica record
-                # can be safely removed. This makes DELETE idempotent.
                 replica_repository.delete(replica.replica_id)
             else:
                 failures += 1

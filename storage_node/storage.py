@@ -26,6 +26,8 @@ class ObjectStorage:
         return self.root / f"{object_id}.bin"
 
     def exists(self, object_id: UUID) -> bool:
+        """Return whether an object exists."""
+
         return self.path_for(object_id).is_file()
 
     def store(self, object_id: UUID, source) -> tuple[int, str]:
@@ -79,6 +81,8 @@ class ObjectStorage:
         return path.open("rb")
 
     def size(self, object_id: UUID) -> int:
+        """Return the physical size of an object."""
+
         path = self.path_for(object_id)
 
         if not path.is_file():
@@ -87,6 +91,8 @@ class ObjectStorage:
         return path.stat().st_size
 
     def delete(self, object_id: UUID) -> None:
+        """Delete an object from the node."""
+
         path = self.path_for(object_id)
 
         try:

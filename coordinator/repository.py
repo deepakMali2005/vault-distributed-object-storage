@@ -93,11 +93,26 @@ class StorageNodeRepository:
         capacity_bytes: int | None = None,
         used_bytes: int | None = None,
     ) -> StorageNode:
-        statement = select(StorageNode).where(
+        url_statement = select(StorageNode).where(
             StorageNode.url == url
         )
+        name_statement = select(StorageNode).where(
+            StorageNode.name == name
+        )
 
-        node = self.db.scalar(statement)
+        node_by_url = self.db.scalar(url_statement)
+        node_by_name = self.db.scalar(name_statement)
+
+        if (
+            node_by_url is not None
+            and node_by_name is not None
+            and node_by_url.node_id != node_by_name.node_id
+        ):
+            raise ValueError(
+                "Storage node name and URL already belong to different nodes"
+            )
+
+        node = node_by_url or node_by_name
 
         if node is None:
             node = StorageNode(
@@ -110,6 +125,7 @@ class StorageNodeRepository:
             self.db.add(node)
         else:
             node.name = name
+            node.url = url
             node.status = status
             node.capacity_bytes = capacity_bytes
             node.used_bytes = used_bytes
