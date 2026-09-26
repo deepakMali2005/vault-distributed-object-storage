@@ -69,7 +69,9 @@ class ObjectRepository:
             ObjectMetadata.object_id,
         )
 
-        return list(self.db.scalars(statement).all())
+        return list(
+            self.db.scalars(statement).all()
+        )
 
     def delete(self, object_id: UUID) -> None:
         metadata = self.get_by_id(object_id)
@@ -140,7 +142,9 @@ class StorageNodeRepository:
             StorageNode.name
         )
 
-        return list(self.db.scalars(statement).all())
+        return list(
+            self.db.scalars(statement).all()
+        )
 
     def list_active(self) -> list[StorageNode]:
         statement = (
@@ -149,10 +153,30 @@ class StorageNodeRepository:
             .order_by(StorageNode.name)
         )
 
-        return list(self.db.scalars(statement).all())
+        return list(
+            self.db.scalars(statement).all()
+        )
+
+    def update_status(
+        self,
+        node_id: UUID,
+        status: str,
+    ) -> StorageNode:
+        """Update the liveness state of a registered storage node."""
+
+        node = self.get_by_id(node_id)
+        node.status = status
+
+        self.db.commit()
+        self.db.refresh(node)
+
+        return node
 
     def get_by_id(self, node_id: UUID) -> StorageNode:
-        node = self.db.get(StorageNode, node_id)
+        node = self.db.get(
+            StorageNode,
+            node_id,
+        )
 
         if node is None:
             raise StorageNodeNotFoundError(node_id)
@@ -252,7 +276,9 @@ class ObjectReplicaRepository:
     ) -> list[ObjectReplica]:
         statement = (
             select(ObjectReplica)
-            .where(ObjectReplica.object_id == object_id)
+            .where(
+                ObjectReplica.object_id == object_id
+            )
             .order_by(
                 ObjectReplica.created_at,
                 ObjectReplica.replica_id,

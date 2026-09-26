@@ -99,6 +99,8 @@ services:
       STORAGE_NODE_URL: http://storage-node-1:8100
       STORAGE_NODES: http://storage-node-1:8100,http://storage-node-2:8101,http://storage-node-3:8102
       REPLICATION_FACTOR: 3
+      HEALTH_CHECK_INTERVAL_SECONDS: 10
+      HEALTH_CHECK_TIMEOUT_SECONDS: 2
     ports:
       - "8000:8000"
     depends_on:

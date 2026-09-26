@@ -1,5 +1,6 @@
 """FastAPI application for the VAULT coordinator."""
 
+import asyncio
 from collections.abc import Iterator
 from contextlib import ExitStack, asynccontextmanager
 from hashlib import sha256
@@ -12,7 +13,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from coordinator.config import settings
-from coordinator.db import get_db, init_db
+from coordinator.db import SessionLocal, get_db, init_db
+from coordinator.health import StorageNodeHealthChecker, run_health_monitor
 from coordinator.placement import PlacementError, select_replicas
 from coordinator.repository import (
     ObjectNotFoundError,
@@ -34,15 +36,19 @@ from coordinator.storage_client import StorageNodeClient, StorageNodeError
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """Initialize coordinator infrastructure when the service starts."""
+    """Initialize coordinator infrastructure and monitor node health."""
 
     init_db()
 
     db = next(get_db())
+
     try:
         repository = StorageNodeRepository(db)
 
-        for index, url in enumerate(settings.configured_storage_nodes(), start=1):
+        for index, url in enumerate(
+            settings.configured_storage_nodes(),
+            start=1,
+        ):
             repository.upsert(
                 name=f"storage-node-{index}",
                 url=url,
@@ -51,7 +57,27 @@ async def lifespan(_app: FastAPI):
     finally:
         db.close()
 
-    yield
+    health_checker = StorageNodeHealthChecker(
+        SessionLocal,
+        timeout_seconds=settings.health_check_timeout_seconds,
+    )
+
+    health_task = asyncio.create_task(
+        run_health_monitor(
+            health_checker,
+            interval_seconds=settings.health_check_interval_seconds,
+        )
+    )
+
+    try:
+        yield
+    finally:
+        health_task.cancel()
+
+        try:
+            await health_task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(
@@ -66,13 +92,16 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-def _buffer_upload(file: UploadFile) -> tuple[SpooledTemporaryFile, int, str]:
+def _buffer_upload(
+    file: UploadFile,
+) -> tuple[SpooledTemporaryFile, int, str]:
     """Buffer an upload into a rewindable temporary stream and calculate its checksum."""
 
     buffered = SpooledTemporaryFile(
         max_size=8 * 1024 * 1024,
         mode="w+b",
     )
+
     digest = sha256()
     size = 0
 
@@ -131,8 +160,8 @@ def _write_replicas(
                 or result.get("checksum") != expected_checksum
             ):
                 raise StorageNodeError(
-                    "Storage node returned object metadata that does not match "
-                    "the uploaded object"
+                    "Storage node returned object metadata that does not "
+                    "match the uploaded object"
                 )
 
             replica_repository.update_state(
@@ -165,9 +194,13 @@ def _get_active_replica_nodes(
 
     candidates = []
 
-    for replica in replica_repository.list_active_for_object(object_id):
+    for replica in replica_repository.list_active_for_object(
+        object_id
+    ):
         try:
-            node = node_repository.get_by_id(replica.node_id)
+            node = node_repository.get_by_id(
+                replica.node_id
+            )
         except StorageNodeNotFoundError:
             continue
 
@@ -186,7 +219,10 @@ def _select_read_replica(
 ) -> StorageNodeClient:
     """Select the first readable ACTIVE replica using a lightweight HEAD check."""
 
-    candidates = _get_active_replica_nodes(db, object_id)
+    candidates = _get_active_replica_nodes(
+        db,
+        object_id,
+    )
 
     if not candidates:
         raise HTTPException(
@@ -200,10 +236,16 @@ def _select_read_replica(
         try:
             response = client.head_object(object_id)
 
-            content_length = response.headers.get("content-length")
+            content_length = response.headers.get(
+                "content-length"
+            )
+
             response.close()
 
-            if content_length is not None and int(content_length) != expected_size:
+            if (
+                content_length is not None
+                and int(content_length) != expected_size
+            ):
                 raise StorageNodeError(
                     "Storage node returned an unexpected object size"
                 )
@@ -243,7 +285,9 @@ def _prepare_read_stream(
             client.stream_object(object_id)
         )
 
-        content_length = response.headers.get("content-length")
+        content_length = response.headers.get(
+            "content-length"
+        )
 
         if (
             content_length is not None
@@ -253,18 +297,30 @@ def _prepare_read_stream(
                 "Storage node returned an unexpected object size"
             )
 
-        iterator = response.iter_bytes(1024 * 1024)
+        iterator = response.iter_bytes(
+            1024 * 1024
+        )
 
-        first_chunk = next(iterator, None)
+        first_chunk = next(
+            iterator,
+            None,
+        )
 
-        if expected_size > 0 and first_chunk is None:
+        if (
+            expected_size > 0
+            and first_chunk is None
+        ):
             raise StorageNodeError(
                 "Storage node returned an empty object for a non-empty object"
             )
 
         return stack, iterator, first_chunk
 
-    except (StorageNodeError, ValueError, StopIteration):
+    except (
+        StorageNodeError,
+        ValueError,
+        StopIteration,
+    ):
         stack.close()
         raise
 
@@ -364,10 +420,14 @@ def put_object(
             ),
         )
 
-    return ObjectMetadataResponse.model_validate(metadata)
+    return ObjectMetadataResponse.model_validate(
+        metadata
+    )
 
 
-@app.get("/objects/{object_key:path}")
+@app.get(
+    "/objects/{object_key:path}"
+)
 def get_object(
     object_key: str,
     db: Session = Depends(get_db),
@@ -375,7 +435,9 @@ def get_object(
     object_repository = ObjectRepository(db)
 
     try:
-        metadata = object_repository.get_by_key(object_key)
+        metadata = object_repository.get_by_key(
+            object_key
+        )
     except ObjectNotFoundError as exc:
         raise HTTPException(
             status_code=404,
@@ -403,7 +465,11 @@ def get_object(
                 metadata.size,
             )
             break
-        except (StorageNodeError, ValueError, StopIteration):
+        except (
+            StorageNodeError,
+            ValueError,
+            StopIteration,
+        ):
             continue
 
     if selected_stream is None:
@@ -434,7 +500,9 @@ def get_object(
     )
 
 
-@app.head("/objects/{object_key:path}")
+@app.head(
+    "/objects/{object_key:path}"
+)
 def head_object(
     object_key: str,
     db: Session = Depends(get_db),
@@ -442,7 +510,9 @@ def head_object(
     object_repository = ObjectRepository(db)
 
     try:
-        metadata = object_repository.get_by_key(object_key)
+        metadata = object_repository.get_by_key(
+            object_key
+        )
     except ObjectNotFoundError as exc:
         raise HTTPException(
             status_code=404,
@@ -454,6 +524,7 @@ def head_object(
         metadata.object_id,
         metadata.size,
     )
+
     client.close()
 
     return Response(
@@ -477,7 +548,9 @@ def delete_object(
     replica_repository = ObjectReplicaRepository(db)
 
     try:
-        metadata = object_repository.get_by_key(object_key)
+        metadata = object_repository.get_by_key(
+            object_key
+        )
     except ObjectNotFoundError as exc:
         raise HTTPException(
             status_code=404,
@@ -487,13 +560,15 @@ def delete_object(
     replica_records = replica_repository.list_for_object(
         metadata.object_id,
     )
-    node_repository = StorageNodeRepository(db)
 
+    node_repository = StorageNodeRepository(db)
     failures = 0
 
     for replica in replica_records:
         try:
-            node = node_repository.get_by_id(replica.node_id)
+            node = node_repository.get_by_id(
+                replica.node_id
+            )
         except StorageNodeNotFoundError:
             failures += 1
             continue
@@ -505,12 +580,18 @@ def delete_object(
         client = StorageNodeClient(node.url)
 
         try:
-            client.delete_object(metadata.object_id)
-            replica_repository.delete(replica.replica_id)
+            client.delete_object(
+                metadata.object_id
+            )
+            replica_repository.delete(
+                replica.replica_id
+            )
 
         except StorageNodeError as exc:
             if exc.status_code == 404:
-                replica_repository.delete(replica.replica_id)
+                replica_repository.delete(
+                    replica.replica_id
+                )
             else:
                 failures += 1
 
@@ -526,7 +607,9 @@ def delete_object(
             ),
         )
 
-    object_repository.delete(metadata.object_id)
+    object_repository.delete(
+        metadata.object_id
+    )
 
 
 @app.get(
@@ -583,3 +666,28 @@ def list_object_replicas(
             for replica in repository.list_for_object(object_id)
         ]
     )
+
+
+@app.post(
+    "/internal/storage-nodes/health-check",
+    response_model=StorageNodeListResponse,
+)
+def check_storage_nodes_health() -> StorageNodeListResponse:
+    """Run an immediate health check for all registered storage nodes."""
+
+    checker = StorageNodeHealthChecker(
+        SessionLocal,
+        timeout_seconds=settings.health_check_timeout_seconds,
+    )
+
+    checker.check_all_nodes()
+
+    with SessionLocal() as db:
+        repository = StorageNodeRepository(db)
+
+        return StorageNodeListResponse(
+            nodes=[
+                StorageNodeResponse.model_validate(node)
+                for node in repository.list_all()
+            ]
+        )

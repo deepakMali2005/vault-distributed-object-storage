@@ -44,6 +44,22 @@ class CoordinatorSettings(BaseSettings):
             "COORDINATOR_STORAGE_NODES",
         ),
     )
+    health_check_interval_seconds: float = Field(
+        default=10.0,
+        validation_alias=AliasChoices(
+            "HEALTH_CHECK_INTERVAL_SECONDS",
+            "COORDINATOR_HEALTH_CHECK_INTERVAL_SECONDS",
+        ),
+        gt=0,
+    )
+    health_check_timeout_seconds: float = Field(
+        default=2.0,
+        validation_alias=AliasChoices(
+            "HEALTH_CHECK_TIMEOUT_SECONDS",
+            "COORDINATOR_HEALTH_CHECK_TIMEOUT_SECONDS",
+        ),
+        gt=0,
+    )
 
     model_config = SettingsConfigDict(
         env_file=".env",
