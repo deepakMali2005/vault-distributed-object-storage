@@ -45,6 +45,7 @@ class StorageNodeListResponse(BaseModel):
 
     nodes: list[StorageNodeResponse]
 
+
 class ObjectReplicaResponse(BaseModel):
     """Internal metadata describing one object replica."""
 
@@ -62,3 +63,36 @@ class ObjectReplicaListResponse(BaseModel):
     """Response containing replica metadata for an object."""
 
     replicas: list[ObjectReplicaResponse]
+
+
+class UnderReplicatedObjectResponse(BaseModel):
+    """Internal status describing one under-replicated object."""
+
+    object_id: UUID
+    object_key: str
+    replication_factor: int
+    healthy_replica_count: int
+    missing_replicas: int
+
+
+class UnderReplicatedObjectListResponse(BaseModel):
+    """Response containing objects that need replica repair."""
+
+    objects: list[UnderReplicatedObjectResponse]
+
+
+class RepairResultResponse(BaseModel):
+    """Internal result of an object repair attempt."""
+
+    object_id: UUID
+    object_key: str
+    healthy_replica_count: int
+    target_replica_count: int
+    repaired_replica_count: int
+    remaining_missing_replicas: int
+
+
+class RepairResultListResponse(BaseModel):
+    """Response containing repair results."""
+
+    results: list[RepairResultResponse]

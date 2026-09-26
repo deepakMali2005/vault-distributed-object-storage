@@ -69,9 +69,7 @@ class ObjectRepository:
             ObjectMetadata.object_id,
         )
 
-        return list(
-            self.db.scalars(statement).all()
-        )
+        return list(self.db.scalars(statement).all())
 
     def delete(self, object_id: UUID) -> None:
         metadata = self.get_by_id(object_id)
@@ -142,9 +140,7 @@ class StorageNodeRepository:
             StorageNode.name
         )
 
-        return list(
-            self.db.scalars(statement).all()
-        )
+        return list(self.db.scalars(statement).all())
 
     def list_active(self) -> list[StorageNode]:
         statement = (
@@ -153,9 +149,7 @@ class StorageNodeRepository:
             .order_by(StorageNode.name)
         )
 
-        return list(
-            self.db.scalars(statement).all()
-        )
+        return list(self.db.scalars(statement).all())
 
     def update_status(
         self,
@@ -166,17 +160,13 @@ class StorageNodeRepository:
 
         node = self.get_by_id(node_id)
         node.status = status
-
         self.db.commit()
         self.db.refresh(node)
 
         return node
 
     def get_by_id(self, node_id: UUID) -> StorageNode:
-        node = self.db.get(
-            StorageNode,
-            node_id,
-        )
+        node = self.db.get(StorageNode, node_id)
 
         if node is None:
             raise StorageNodeNotFoundError(node_id)
@@ -233,6 +223,30 @@ class ObjectReplicaRepository:
 
         return replicas
 
+    def mark_failed_for_node(
+        self,
+        node_id: UUID,
+    ) -> int:
+        """Mark all non-failed replicas on an unavailable node as FAILED."""
+
+        statement = (
+            select(ObjectReplica)
+            .where(
+                ObjectReplica.node_id == node_id,
+                ObjectReplica.state != "FAILED",
+            )
+        )
+
+        replicas = list(self.db.scalars(statement).all())
+
+        for replica in replicas:
+            replica.state = "FAILED"
+
+        if replicas:
+            self.db.commit()
+
+        return len(replicas)
+
     def update_state(
         self,
         replica_id: UUID,
@@ -276,9 +290,7 @@ class ObjectReplicaRepository:
     ) -> list[ObjectReplica]:
         statement = (
             select(ObjectReplica)
-            .where(
-                ObjectReplica.object_id == object_id
-            )
+            .where(ObjectReplica.object_id == object_id)
             .order_by(
                 ObjectReplica.created_at,
                 ObjectReplica.replica_id,

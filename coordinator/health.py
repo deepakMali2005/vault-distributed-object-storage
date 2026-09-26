@@ -8,7 +8,7 @@ from collections.abc import Callable
 import httpx
 from sqlalchemy.orm import Session
 
-from coordinator.repository import StorageNodeRepository
+from coordinator.repository import ObjectReplicaRepository, StorageNodeRepository
 
 ACTIVE = "ACTIVE"
 FAILED = "FAILED"
@@ -56,14 +56,23 @@ class StorageNodeHealthChecker:
             nodes = repository.list_all()
             results: dict[str, bool] = {}
 
+            replica_repository = ObjectReplicaRepository(db)
+
             for node in nodes:
                 healthy = self.check_node(node.url)
                 results[str(node.node_id)] = healthy
 
+                status = ACTIVE if healthy else FAILED
+
                 repository.update_status(
                     node.node_id,
-                    ACTIVE if healthy else FAILED,
+                    status,
                 )
+
+                if not healthy:
+                    replica_repository.mark_failed_for_node(
+                        node.node_id,
+                    )
 
             return results
 
@@ -72,12 +81,14 @@ async def run_health_monitor(
     checker: StorageNodeHealthChecker,
     *,
     interval_seconds: float,
+    after_check: Callable[[], None] | None = None,
 ) -> None:
     """Continuously check storage nodes until the application is shut down."""
 
     while True:
-        await asyncio.to_thread(
-            checker.check_all_nodes
-        )
+        await asyncio.to_thread(checker.check_all_nodes)
+
+        if after_check is not None:
+            await asyncio.to_thread(after_check)
 
         await asyncio.sleep(interval_seconds)

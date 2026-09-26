@@ -1,7 +1,7 @@
 """FastAPI application for the VAULT coordinator."""
 
-import asyncio
 from collections.abc import Iterator
+import asyncio
 from contextlib import ExitStack, asynccontextmanager
 from hashlib import sha256
 from tempfile import SpooledTemporaryFile
@@ -16,6 +16,7 @@ from coordinator.config import settings
 from coordinator.db import SessionLocal, get_db, init_db
 from coordinator.health import StorageNodeHealthChecker, run_health_monitor
 from coordinator.placement import PlacementError, select_replicas
+from coordinator.repair import ReplicaRepairService
 from coordinator.repository import (
     ObjectNotFoundError,
     ObjectReplicaRepository,
@@ -28,8 +29,12 @@ from coordinator.schemas import (
     ObjectMetadataResponse,
     ObjectReplicaListResponse,
     ObjectReplicaResponse,
+    RepairResultListResponse,
+    RepairResultResponse,
     StorageNodeListResponse,
     StorageNodeResponse,
+    UnderReplicatedObjectListResponse,
+    UnderReplicatedObjectResponse,
 )
 from coordinator.storage_client import StorageNodeClient, StorageNodeError
 
@@ -54,6 +59,7 @@ async def lifespan(_app: FastAPI):
                 url=url,
                 status="ACTIVE",
             )
+
     finally:
         db.close()
 
@@ -62,15 +68,38 @@ async def lifespan(_app: FastAPI):
         timeout_seconds=settings.health_check_timeout_seconds,
     )
 
+    def repair_after_health_check() -> None:
+        """Repair objects after health checks when a node is unavailable."""
+
+        with SessionLocal() as health_db:
+            nodes = StorageNodeRepository(
+                health_db
+            ).list_all()
+
+            has_failed_node = any(
+                node.status == "FAILED"
+                for node in nodes
+            )
+
+        if not has_failed_node:
+            return
+
+        ReplicaRepairService(
+            SessionLocal,
+            replication_factor=settings.replication_factor,
+        ).repair_all()
+
     health_task = asyncio.create_task(
         run_health_monitor(
             health_checker,
             interval_seconds=settings.health_check_interval_seconds,
+            after_check=repair_after_health_check,
         )
     )
 
     try:
         yield
+
     finally:
         health_task.cancel()
 
@@ -107,7 +136,9 @@ def _buffer_upload(
 
     try:
         while True:
-            chunk = file.file.read(1024 * 1024)
+            chunk = file.file.read(
+                1024 * 1024
+            )
 
             if not chunk:
                 break
@@ -144,7 +175,9 @@ def _write_replicas(
         replica_records,
         strict=True,
     ):
-        client = StorageNodeClient(node.url)
+        client = StorageNodeClient(
+            node.url
+        )
 
         try:
             buffered.seek(0)
@@ -155,13 +188,16 @@ def _write_replicas(
             )
 
             if (
-                result.get("object_id") != str(object_id)
-                or result.get("size") != expected_size
-                or result.get("checksum") != expected_checksum
+                result.get("object_id")
+                != str(object_id)
+                or result.get("size")
+                != expected_size
+                or result.get("checksum")
+                != expected_checksum
             ):
                 raise StorageNodeError(
-                    "Storage node returned object metadata that does not "
-                    "match the uploaded object"
+                    "Storage node returned object metadata that does not match "
+                    "the uploaded object"
                 )
 
             replica_repository.update_state(
@@ -201,13 +237,16 @@ def _get_active_replica_nodes(
             node = node_repository.get_by_id(
                 replica.node_id
             )
+
         except StorageNodeNotFoundError:
             continue
 
         if node.status != "ACTIVE":
             continue
 
-        candidates.append((replica, node))
+        candidates.append(
+            (replica, node)
+        )
 
     return candidates
 
@@ -231,10 +270,14 @@ def _select_read_replica(
         )
 
     for _replica, node in candidates:
-        client = StorageNodeClient(node.url)
+        client = StorageNodeClient(
+            node.url
+        )
 
         try:
-            response = client.head_object(object_id)
+            response = client.head_object(
+                object_id
+            )
 
             content_length = response.headers.get(
                 "content-length"
@@ -252,7 +295,10 @@ def _select_read_replica(
 
             return client
 
-        except (StorageNodeError, ValueError):
+        except (
+            StorageNodeError,
+            ValueError,
+        ):
             client.close()
 
     raise HTTPException(
@@ -276,13 +322,19 @@ def _prepare_read_stream(
     """
 
     stack = ExitStack()
-    client = StorageNodeClient(node_url)
+    client = StorageNodeClient(
+        node_url
+    )
 
-    stack.callback(client.close)
+    stack.callback(
+        client.close
+    )
 
     try:
         response = stack.enter_context(
-            client.stream_object(object_id)
+            client.stream_object(
+                object_id
+            )
         )
 
         content_length = response.headers.get(
@@ -314,7 +366,11 @@ def _prepare_read_stream(
                 "Storage node returned an empty object for a non-empty object"
             )
 
-        return stack, iterator, first_chunk
+        return (
+            stack,
+            iterator,
+            first_chunk,
+        )
 
     except (
         StorageNodeError,
@@ -345,9 +401,13 @@ def put_object(
     node_repository = StorageNodeRepository(db)
 
     try:
-        object_repository.get_by_key(object_key)
+        object_repository.get_by_key(
+            object_key
+        )
+
     except ObjectNotFoundError:
         pass
+
     else:
         raise HTTPException(
             status_code=409,
@@ -364,6 +424,7 @@ def put_object(
             active_nodes,
             settings.replication_factor,
         )
+
     except PlacementError as exc:
         raise HTTPException(
             status_code=503,
@@ -371,7 +432,10 @@ def put_object(
         ) from exc
 
     try:
-        buffered, size, checksum = _buffer_upload(file)
+        buffered, size, checksum = _buffer_upload(
+            file
+        )
+
     finally:
         file.file.close()
 
@@ -383,8 +447,10 @@ def put_object(
                 size=size,
                 checksum=checksum,
             )
+
         except IntegrityError as exc:
             db.rollback()
+
             raise HTTPException(
                 status_code=409,
                 detail="Object key already exists",
@@ -438,6 +504,7 @@ def get_object(
         metadata = object_repository.get_by_key(
             object_key
         )
+
     except ObjectNotFoundError as exc:
         raise HTTPException(
             status_code=404,
@@ -465,6 +532,7 @@ def get_object(
                 metadata.size,
             )
             break
+
         except (
             StorageNodeError,
             ValueError,
@@ -494,7 +562,9 @@ def get_object(
         body(),
         media_type="application/octet-stream",
         headers={
-            "Content-Length": str(metadata.size),
+            "Content-Length": str(
+                metadata.size
+            ),
             "ETag": f'"{metadata.checksum}"',
         },
     )
@@ -513,6 +583,7 @@ def head_object(
         metadata = object_repository.get_by_key(
             object_key
         )
+
     except ObjectNotFoundError as exc:
         raise HTTPException(
             status_code=404,
@@ -530,7 +601,9 @@ def head_object(
     return Response(
         status_code=200,
         headers={
-            "Content-Length": str(metadata.size),
+            "Content-Length": str(
+                metadata.size
+            ),
             "ETag": f'"{metadata.checksum}"',
         },
     )
@@ -551,6 +624,7 @@ def delete_object(
         metadata = object_repository.get_by_key(
             object_key
         )
+
     except ObjectNotFoundError as exc:
         raise HTTPException(
             status_code=404,
@@ -558,10 +632,11 @@ def delete_object(
         ) from exc
 
     replica_records = replica_repository.list_for_object(
-        metadata.object_id,
+        metadata.object_id
     )
 
     node_repository = StorageNodeRepository(db)
+
     failures = 0
 
     for replica in replica_records:
@@ -569,6 +644,7 @@ def delete_object(
             node = node_repository.get_by_id(
                 replica.node_id
             )
+
         except StorageNodeNotFoundError:
             failures += 1
             continue
@@ -577,12 +653,15 @@ def delete_object(
             failures += 1
             continue
 
-        client = StorageNodeClient(node.url)
+        client = StorageNodeClient(
+            node.url
+        )
 
         try:
             client.delete_object(
                 metadata.object_id
             )
+
             replica_repository.delete(
                 replica.replica_id
             )
@@ -623,7 +702,9 @@ def list_objects(
 
     return ObjectListResponse(
         objects=[
-            ObjectMetadataResponse.model_validate(obj)
+            ObjectMetadataResponse.model_validate(
+                obj
+            )
             for obj in object_repository.list_all()
         ]
     )
@@ -642,7 +723,9 @@ def list_storage_nodes(
 
     return StorageNodeListResponse(
         nodes=[
-            StorageNodeResponse.model_validate(node)
+            StorageNodeResponse.model_validate(
+                node
+            )
             for node in repository.list_all()
         ]
     )
@@ -662,8 +745,65 @@ def list_object_replicas(
 
     return ObjectReplicaListResponse(
         replicas=[
-            ObjectReplicaResponse.model_validate(replica)
-            for replica in repository.list_for_object(object_id)
+            ObjectReplicaResponse.model_validate(
+                replica
+            )
+            for replica in repository.list_for_object(
+                object_id
+            )
+        ]
+    )
+
+
+@app.get(
+    "/internal/under-replicated",
+    response_model=UnderReplicatedObjectListResponse,
+)
+def list_under_replicated_objects() -> UnderReplicatedObjectListResponse:
+    """Return objects whose effective healthy replica count is below the target."""
+
+    service = ReplicaRepairService(
+        SessionLocal,
+        replication_factor=settings.replication_factor,
+    )
+
+    return UnderReplicatedObjectListResponse(
+        objects=[
+            UnderReplicatedObjectResponse(
+                object_id=item.object_id,
+                object_key=item.object_key,
+                replication_factor=item.replication_factor,
+                healthy_replica_count=item.healthy_replica_count,
+                missing_replicas=item.missing_replicas,
+            )
+            for item in service.find_under_replicated()
+        ]
+    )
+
+
+@app.post(
+    "/internal/repair",
+    response_model=RepairResultListResponse,
+)
+def repair_under_replicated_objects() -> RepairResultListResponse:
+    """Repair all currently under-replicated objects."""
+
+    service = ReplicaRepairService(
+        SessionLocal,
+        replication_factor=settings.replication_factor,
+    )
+
+    return RepairResultListResponse(
+        results=[
+            RepairResultResponse(
+                object_id=result.object_id,
+                object_key=result.object_key,
+                healthy_replica_count=result.healthy_replica_count,
+                target_replica_count=result.target_replica_count,
+                repaired_replica_count=result.repaired_replica_count,
+                remaining_missing_replicas=result.remaining_missing_replicas,
+            )
+            for result in service.repair_all()
         ]
     )
 
@@ -687,7 +827,9 @@ def check_storage_nodes_health() -> StorageNodeListResponse:
 
         return StorageNodeListResponse(
             nodes=[
-                StorageNodeResponse.model_validate(node)
+                StorageNodeResponse.model_validate(
+                    node
+                )
                 for node in repository.list_all()
             ]
         )
