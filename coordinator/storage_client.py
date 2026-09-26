@@ -10,6 +10,15 @@ import httpx
 class StorageNodeError(Exception):
     """Raised when a storage-node operation fails."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
 
 class StorageNodeClient:
     """Client used by the coordinator to communicate with a storage node."""
@@ -45,7 +54,8 @@ class StorageNodeClient:
             if response.is_error:
                 raise StorageNodeError(
                     "Storage node PUT failed with status "
-                    f"{response.status_code}"
+                    f"{response.status_code}",
+                    status_code=response.status_code,
                 )
 
             return response.json()
@@ -67,13 +77,15 @@ class StorageNodeClient:
             ) as response:
                 if response.status_code == 404:
                     raise StorageNodeError(
-                        "Object not found on storage node"
+                        "Object not found on storage node",
+                        status_code=404,
                     )
 
                 if response.is_error:
                     raise StorageNodeError(
                         "Storage node GET failed with status "
-                        f"{response.status_code}"
+                        f"{response.status_code}",
+                        status_code=response.status_code,
                     )
 
                 yield response
@@ -95,14 +107,19 @@ class StorageNodeClient:
             ) from exc
 
         if response.status_code == 404:
+            response.close()
             raise StorageNodeError(
-                "Object not found on storage node"
+                "Object not found on storage node",
+                status_code=404,
             )
 
         if response.is_error:
+            status_code = response.status_code
+            response.close()
             raise StorageNodeError(
                 "Storage node HEAD failed with status "
-                f"{response.status_code}"
+                f"{status_code}",
+                status_code=status_code,
             )
 
         return response
@@ -119,12 +136,19 @@ class StorageNodeClient:
             ) from exc
 
         if response.status_code == 404:
+            response.close()
             raise StorageNodeError(
-                "Object not found on storage node"
+                "Object not found on storage node",
+                status_code=404,
             )
 
         if response.is_error:
+            status_code = response.status_code
+            response.close()
             raise StorageNodeError(
                 "Storage node DELETE failed with status "
-                f"{response.status_code}"
+                f"{status_code}",
+                status_code=status_code,
             )
+
+        response.close()

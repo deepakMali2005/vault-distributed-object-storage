@@ -8,18 +8,25 @@ from sqlalchemy.pool import StaticPool
 
 from coordinator import main
 from coordinator.db import Base
-from coordinator.models import StorageNode
+from coordinator.models import ObjectReplica, StorageNode
 from coordinator.storage_client import StorageNodeError
 
 
 class FakeStorageResponse:
-    """Minimal streaming response used by coordinator API tests."""
+    """Minimal response used by coordinator API tests."""
 
-    def __init__(self, payload: bytes) -> None:
+    def __init__(self, payload: bytes = b"", status_code: int = 200) -> None:
         self.payload = payload
+        self.status_code = status_code
+        self.headers = {
+            "content-length": str(len(payload)),
+        }
 
     def iter_bytes(self, _chunk_size: int):
         yield self.payload
+
+    def close(self) -> None:
+        pass
 
 
 class FakeStorageNodeClient:
@@ -27,6 +34,7 @@ class FakeStorageNodeClient:
 
     objects_by_node: dict[str, dict[UUID, bytes]] = {}
     failed_urls: set[str] = set()
+    get_failed_urls: set[str] = set()
 
     def __init__(self, base_url: str) -> None:
         self.base_url = base_url.rstrip("/")
@@ -38,6 +46,12 @@ class FakeStorageNodeClient:
     def close(self) -> None:
         pass
 
+    def _raise_if_failed(self, operation: str) -> None:
+        if self.base_url in self.failed_urls:
+            raise StorageNodeError(
+                f"simulated storage-node {operation} failure"
+            )
+
     def put_object(
         self,
         object_id,
@@ -45,10 +59,7 @@ class FakeStorageNodeClient:
         filename=None,
         content_type=None,
     ):
-        if self.base_url in self.failed_urls:
-            raise StorageNodeError(
-                "simulated storage-node failure"
-            )
+        self._raise_if_failed("PUT")
 
         payload = file.read()
 
@@ -66,15 +77,40 @@ class FakeStorageNodeClient:
             ).hexdigest(),
         }
 
-    @contextmanager
-    def stream_object(self, object_id):
+    def head_object(self, object_id):
+        self._raise_if_failed("HEAD")
+
         objects = self.objects_by_node[
             self.base_url
         ]
 
         if object_id not in objects:
             raise StorageNodeError(
-                "Object not found on storage node"
+                "Object not found on storage node",
+                status_code=404,
+            )
+
+        return FakeStorageResponse(
+            objects[object_id],
+        )
+
+    @contextmanager
+    def stream_object(self, object_id):
+        if self.base_url in self.get_failed_urls:
+            raise StorageNodeError(
+                "simulated storage-node GET failure"
+            )
+
+        self._raise_if_failed("GET")
+
+        objects = self.objects_by_node[
+            self.base_url
+        ]
+
+        if object_id not in objects:
+            raise StorageNodeError(
+                "Object not found on storage node",
+                status_code=404,
             )
 
         yield FakeStorageResponse(
@@ -82,13 +118,16 @@ class FakeStorageNodeClient:
         )
 
     def delete_object(self, object_id):
+        self._raise_if_failed("DELETE")
+
         objects = self.objects_by_node[
             self.base_url
         ]
 
         if object_id not in objects:
             raise StorageNodeError(
-                "Object not found on storage node"
+                "Object not found on storage node",
+                status_code=404,
             )
 
         del objects[object_id]
@@ -151,12 +190,6 @@ def create_test_client(monkeypatch):
 
     monkeypatch.setattr(
         main.settings,
-        "storage_node_url",
-        "http://test-storage-1",
-    )
-
-    monkeypatch.setattr(
-        main.settings,
         "replication_factor",
         3,
     )
@@ -167,6 +200,7 @@ def create_test_client(monkeypatch):
 
     FakeStorageNodeClient.objects_by_node = {}
     FakeStorageNodeClient.failed_urls = set()
+    FakeStorageNodeClient.get_failed_urls = set()
 
     return TestClient(main.app), engine
 
@@ -255,6 +289,11 @@ def test_object_lifecycle(monkeypatch):
 
         assert delete_response.status_code == 204
 
+        assert all(
+            not objects
+            for objects in FakeStorageNodeClient.objects_by_node.values()
+        )
+
         missing_response = client.get(
             "/objects/demo/hello.txt"
         )
@@ -337,6 +376,223 @@ def test_partial_replication_returns_error_and_records_replica_states(
                 "http://test-storage-3"
             ]
         )
+
+    finally:
+        main.app.dependency_overrides.clear()
+        engine.dispose()
+
+
+def test_get_falls_back_when_selected_replica_fails_during_get(monkeypatch):
+    client, engine = create_test_client(monkeypatch)
+    payload = b"replica fallback"
+
+    try:
+        put_response = client.put(
+            "/objects/demo/fallback.txt",
+            files={"file": ("object.txt", payload)},
+        )
+        assert put_response.status_code == 200
+
+        FakeStorageNodeClient.get_failed_urls = {
+            "http://test-storage-1"
+        }
+
+        response = client.get("/objects/demo/fallback.txt")
+
+        assert response.status_code == 200
+        assert response.content == payload
+
+    finally:
+        main.app.dependency_overrides.clear()
+        engine.dispose()
+
+
+def test_get_returns_service_unavailable_when_all_replicas_fail(monkeypatch):
+    client, engine = create_test_client(monkeypatch)
+    payload = b"unavailable replicas"
+
+    try:
+        put_response = client.put(
+            "/objects/demo/unavailable.txt",
+            files={"file": ("object.txt", payload)},
+        )
+        assert put_response.status_code == 200
+
+        FakeStorageNodeClient.failed_urls = {
+            "http://test-storage-1",
+            "http://test-storage-2",
+            "http://test-storage-3",
+        }
+
+        response = client.get("/objects/demo/unavailable.txt")
+
+        assert response.status_code == 503
+        assert response.json()["detail"] == (
+            "No active replica is available for this object"
+        )
+
+    finally:
+        main.app.dependency_overrides.clear()
+        engine.dispose()
+
+
+def test_head_falls_back_to_another_active_replica(monkeypatch):
+    client, engine = create_test_client(monkeypatch)
+    payload = b"head fallback"
+
+    try:
+        put_response = client.put(
+            "/objects/demo/head.txt",
+            files={"file": ("object.txt", payload)},
+        )
+        assert put_response.status_code == 200
+        checksum = put_response.json()["checksum"]
+
+        FakeStorageNodeClient.failed_urls = {
+            "http://test-storage-1"
+        }
+
+        response = client.head("/objects/demo/head.txt")
+
+        assert response.status_code == 200
+        assert response.headers["content-length"] == str(len(payload))
+        assert response.headers["etag"] == f'"{checksum}"'
+        assert response.content == b""
+
+    finally:
+        main.app.dependency_overrides.clear()
+        engine.dispose()
+
+
+def test_delete_propagates_to_all_replicas(monkeypatch):
+    client, engine = create_test_client(monkeypatch)
+    payload = b"delete replicas"
+
+    try:
+        put_response = client.put(
+            "/objects/demo/delete.txt",
+            files={"file": ("object.txt", payload)},
+        )
+        assert put_response.status_code == 200
+        object_id = UUID(put_response.json()["object_id"])
+
+        response = client.delete("/objects/demo/delete.txt")
+
+        assert response.status_code == 204
+        assert all(
+            object_id not in objects
+            for objects in FakeStorageNodeClient.objects_by_node.values()
+        )
+
+        replica_response = client.get(
+            f"/internal/objects/{object_id}/replicas"
+        )
+        assert replica_response.json()["replicas"] == []
+
+        assert client.get("/objects/demo/delete.txt").status_code == 404
+
+    finally:
+        main.app.dependency_overrides.clear()
+        engine.dispose()
+
+
+def test_partial_delete_preserves_failed_replica_metadata(monkeypatch):
+    client, engine = create_test_client(monkeypatch)
+    payload = b"partial delete"
+
+    try:
+        put_response = client.put(
+            "/objects/demo/partial-delete.txt",
+            files={"file": ("object.txt", payload)},
+        )
+        assert put_response.status_code == 200
+        object_id = UUID(put_response.json()["object_id"])
+
+        FakeStorageNodeClient.failed_urls = {
+            "http://test-storage-1"
+        }
+
+        response = client.delete("/objects/demo/partial-delete.txt")
+
+        assert response.status_code == 502
+        assert response.json()["detail"] == (
+            "Object deletion incomplete: 1 replica(s) could not be deleted"
+        )
+
+        assert object_id in FakeStorageNodeClient.objects_by_node[
+            "http://test-storage-1"
+        ]
+        assert object_id not in FakeStorageNodeClient.objects_by_node[
+            "http://test-storage-2"
+        ]
+        assert object_id not in FakeStorageNodeClient.objects_by_node[
+            "http://test-storage-3"
+        ]
+
+        replica_response = client.get(
+            f"/internal/objects/{object_id}/replicas"
+        )
+        replicas = replica_response.json()["replicas"]
+
+        assert len(replicas) == 1
+        assert replicas[0]["state"] == "ACTIVE"
+
+        FakeStorageNodeClient.failed_urls = set()
+
+        retry_response = client.delete("/objects/demo/partial-delete.txt")
+
+        assert retry_response.status_code == 204
+        assert client.get("/objects/demo/partial-delete.txt").status_code == 404
+
+    finally:
+        main.app.dependency_overrides.clear()
+        engine.dispose()
+
+
+def test_delete_attempts_all_replica_records_not_only_active_records(monkeypatch):
+    client, engine = create_test_client(monkeypatch)
+    payload = b"delete every replica record"
+
+    try:
+        put_response = client.put(
+            "/objects/demo/all-replicas.txt",
+            files={"file": ("object.txt", payload)},
+        )
+        assert put_response.status_code == 200
+        object_id = UUID(put_response.json()["object_id"])
+
+        replica_response = client.get(
+            f"/internal/objects/{object_id}/replicas"
+        )
+        replicas = replica_response.json()["replicas"]
+        assert len(replicas) == 3
+
+        # Simulate a stale FAILED metadata state while the physical copy still
+        # exists. DELETE must still attempt this replica instead of silently
+        # leaving its bytes behind.
+        failed_replica_id = replicas[0]["replica_id"]
+        with Session(engine) as db:
+            replica = db.get(
+                ObjectReplica,
+                UUID(failed_replica_id),
+            )
+            assert replica is not None
+            replica.state = "FAILED"
+            db.commit()
+
+        response = client.delete("/objects/demo/all-replicas.txt")
+
+        assert response.status_code == 204
+        assert all(
+            object_id not in objects
+            for objects in FakeStorageNodeClient.objects_by_node.values()
+        )
+        assert client.get("/objects/demo/all-replicas.txt").status_code == 404
+
+        replica_response = client.get(
+            f"/internal/objects/{object_id}/replicas"
+        )
+        assert replica_response.json()["replicas"] == []
 
     finally:
         main.app.dependency_overrides.clear()

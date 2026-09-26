@@ -1,7 +1,7 @@
 """FastAPI application for the VAULT coordinator."""
 
 from collections.abc import Iterator
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from hashlib import sha256
 from tempfile import SpooledTemporaryFile
 from uuid import UUID, uuid4
@@ -17,6 +17,7 @@ from coordinator.repository import (
     ObjectNotFoundError,
     ObjectReplicaRepository,
     ObjectRepository,
+    StorageNodeNotFoundError,
     StorageNodeRepository,
 )
 from coordinator.schemas import (
@@ -151,6 +152,121 @@ def _write_replicas(
     return successful_writes
 
 
+def _get_active_replica_nodes(
+    db: Session,
+    object_id: UUID,
+):
+    """Return ACTIVE replica records whose storage nodes are also ACTIVE."""
+
+    replica_repository = ObjectReplicaRepository(db)
+    node_repository = StorageNodeRepository(db)
+
+    candidates = []
+
+    for replica in replica_repository.list_active_for_object(object_id):
+        try:
+            node = node_repository.get_by_id(replica.node_id)
+        except StorageNodeNotFoundError:
+            continue
+
+        if node.status != "ACTIVE":
+            continue
+
+        candidates.append((replica, node))
+
+    return candidates
+
+
+def _select_read_replica(
+    db: Session,
+    object_id: UUID,
+    expected_size: int,
+) -> StorageNodeClient:
+    """Select the first readable ACTIVE replica using a lightweight HEAD check."""
+
+    candidates = _get_active_replica_nodes(db, object_id)
+
+    if not candidates:
+        raise HTTPException(
+            status_code=503,
+            detail="No active replica is available for this object",
+        )
+
+    for _replica, node in candidates:
+        client = StorageNodeClient(node.url)
+
+        try:
+            response = client.head_object(object_id)
+
+            content_length = response.headers.get("content-length")
+            response.close()
+
+            if content_length is not None and int(content_length) != expected_size:
+                raise StorageNodeError(
+                    "Storage node returned an unexpected object size"
+                )
+
+            return client
+
+        except (StorageNodeError, ValueError):
+            client.close()
+
+    raise HTTPException(
+        status_code=503,
+        detail="No active replica is available for this object",
+    )
+
+
+def _prepare_read_stream(
+    node_url: str,
+    object_id: UUID,
+    expected_size: int,
+):
+    """Open a replica stream and read its first chunk before sending HTTP headers.
+
+    The coordinator must establish that at least one replica can actually serve
+    the object before returning a StreamingResponse. Otherwise an exception
+    raised later by the streaming generator occurs after Starlette has already
+    committed the HTTP status line, producing a RuntimeError instead of a clean
+    503.
+    """
+
+    stack = ExitStack()
+    client = StorageNodeClient(node_url)
+
+    stack.callback(client.close)
+
+    try:
+        response = stack.enter_context(
+            client.stream_object(object_id)
+        )
+
+        content_length = response.headers.get("content-length")
+
+        if (
+            content_length is not None
+            and int(content_length) != expected_size
+        ):
+            raise StorageNodeError(
+                "Storage node returned an unexpected object size"
+            )
+
+        iterator = response.iter_bytes(1024 * 1024)
+
+        first_chunk = next(iterator, None)
+
+        if expected_size > 0 and first_chunk is None:
+            raise StorageNodeError(
+                "Storage node returned an empty object for a non-empty object"
+            )
+
+        return stack, iterator, first_chunk
+
+    except (StorageNodeError, ValueError, StopIteration):
+        stack.close()
+        raise
+
+
 @app.put(
     "/objects/{object_key:path}",
     response_model=ObjectMetadataResponse,
@@ -257,14 +373,47 @@ def get_object(
             detail="Object not found",
         ) from exc
 
-    client = StorageNodeClient(settings.storage_node_url)
+    candidates = _get_active_replica_nodes(
+        db,
+        metadata.object_id,
+    )
+
+    if not candidates:
+        raise HTTPException(
+            status_code=503,
+            detail="No active replica is available for this object",
+        )
+
+    selected_stream = None
+
+    for _replica, node in candidates:
+        try:
+            selected_stream = _prepare_read_stream(
+                node.url,
+                metadata.object_id,
+                metadata.size,
+            )
+            break
+        except (StorageNodeError, ValueError, StopIteration):
+            continue
+
+    if selected_stream is None:
+        raise HTTPException(
+            status_code=503,
+            detail="No active replica is available for this object",
+        )
+
+    stack, iterator, first_chunk = selected_stream
 
     def body() -> Iterator[bytes]:
         try:
-            with client.stream_object(metadata.object_id) as response:
-                yield from response.iter_bytes(1024 * 1024)
+            if first_chunk is not None:
+                yield first_chunk
+
+            yield from iterator
+
         finally:
-            client.close()
+            stack.close()
 
     return StreamingResponse(
         body(),
@@ -291,6 +440,13 @@ def head_object(
             detail="Object not found",
         ) from exc
 
+    client = _select_read_replica(
+        db,
+        metadata.object_id,
+        metadata.size,
+    )
+    client.close()
+
     return Response(
         status_code=200,
         headers={
@@ -309,6 +465,7 @@ def delete_object(
     db: Session = Depends(get_db),
 ) -> None:
     object_repository = ObjectRepository(db)
+    replica_repository = ObjectReplicaRepository(db)
 
     try:
         metadata = object_repository.get_by_key(object_key)
@@ -318,17 +475,49 @@ def delete_object(
             detail="Object not found",
         ) from exc
 
-    client = StorageNodeClient(settings.storage_node_url)
+    replica_records = replica_repository.list_for_object(
+        metadata.object_id,
+    )
+    node_repository = StorageNodeRepository(db)
 
-    try:
-        client.delete_object(metadata.object_id)
-    except StorageNodeError as exc:
+    failures = 0
+
+    for replica in replica_records:
+        try:
+            node = node_repository.get_by_id(replica.node_id)
+        except StorageNodeNotFoundError:
+            failures += 1
+            continue
+
+        if node.status != "ACTIVE":
+            failures += 1
+            continue
+
+        client = StorageNodeClient(node.url)
+
+        try:
+            client.delete_object(metadata.object_id)
+            replica_repository.delete(replica.replica_id)
+
+        except StorageNodeError as exc:
+            if exc.status_code == 404:
+                # The physical copy is already absent, so the replica record
+                # can be safely removed. This makes DELETE idempotent.
+                replica_repository.delete(replica.replica_id)
+            else:
+                failures += 1
+
+        finally:
+            client.close()
+
+    if failures:
         raise HTTPException(
             status_code=502,
-            detail=str(exc),
-        ) from exc
-    finally:
-        client.close()
+            detail=(
+                "Object deletion incomplete: "
+                f"{failures} replica(s) could not be deleted"
+            ),
+        )
 
     object_repository.delete(metadata.object_id)
 

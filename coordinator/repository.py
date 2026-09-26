@@ -215,6 +215,21 @@ class ObjectReplicaRepository:
 
         return replica
 
+    def delete(
+        self,
+        replica_id: UUID,
+    ) -> None:
+        replica = self.db.get(
+            ObjectReplica,
+            replica_id,
+        )
+
+        if replica is None:
+            return
+
+        self.db.delete(replica)
+        self.db.commit()
+
     def list_for_object(
         self,
         object_id: UUID,
