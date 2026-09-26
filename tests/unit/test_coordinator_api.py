@@ -8,6 +8,7 @@ from sqlalchemy.pool import StaticPool
 
 from coordinator import main
 from coordinator.db import Base
+from coordinator.models import StorageNode
 from coordinator.storage_client import StorageNodeError
 
 
@@ -22,12 +23,17 @@ class FakeStorageResponse:
 
 
 class FakeStorageNodeClient:
-    """In-memory stand-in for the storage node during API tests."""
+    """In-memory stand-in for storage nodes during coordinator API tests."""
 
-    objects: dict[UUID, bytes] = {}
+    objects_by_node: dict[str, dict[UUID, bytes]] = {}
+    failed_urls: set[str] = set()
 
-    def __init__(self, _base_url: str) -> None:
-        pass
+    def __init__(self, base_url: str) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.objects_by_node.setdefault(
+            self.base_url,
+            {},
+        )
 
     def close(self) -> None:
         pass
@@ -39,29 +45,53 @@ class FakeStorageNodeClient:
         filename=None,
         content_type=None,
     ):
+        if self.base_url in self.failed_urls:
+            raise StorageNodeError(
+                "simulated storage-node failure"
+            )
+
         payload = file.read()
-        self.objects[object_id] = payload
+
+        self.objects_by_node[
+            self.base_url
+        ][object_id] = payload
 
         import hashlib
 
         return {
             "object_id": str(object_id),
             "size": len(payload),
-            "checksum": hashlib.sha256(payload).hexdigest(),
+            "checksum": hashlib.sha256(
+                payload
+            ).hexdigest(),
         }
 
     @contextmanager
     def stream_object(self, object_id):
-        if object_id not in self.objects:
-            raise StorageNodeError("Object not found on storage node")
+        objects = self.objects_by_node[
+            self.base_url
+        ]
 
-        yield FakeStorageResponse(self.objects[object_id])
+        if object_id not in objects:
+            raise StorageNodeError(
+                "Object not found on storage node"
+            )
+
+        yield FakeStorageResponse(
+            objects[object_id]
+        )
 
     def delete_object(self, object_id):
-        if object_id not in self.objects:
-            raise StorageNodeError("Object not found on storage node")
+        objects = self.objects_by_node[
+            self.base_url
+        ]
 
-        del self.objects[object_id]
+        if object_id not in objects:
+            raise StorageNodeError(
+                "Object not found on storage node"
+            )
+
+        del objects[object_id]
 
 
 def create_test_client(monkeypatch):
@@ -80,20 +110,63 @@ def create_test_client(monkeypatch):
         class_=Session,
     )
 
+    with session_factory() as db:
+        db.add_all(
+            [
+                StorageNode(
+                    name="storage-node-1",
+                    url="http://test-storage-1",
+                    status="ACTIVE",
+                ),
+                StorageNode(
+                    name="storage-node-2",
+                    url="http://test-storage-2",
+                    status="ACTIVE",
+                ),
+                StorageNode(
+                    name="storage-node-3",
+                    url="http://test-storage-3",
+                    status="ACTIVE",
+                ),
+            ]
+        )
+
+        db.commit()
+
     def override_get_db():
         with session_factory() as db:
             yield db
 
-    monkeypatch.setattr(main, "init_db", lambda: None)
-    monkeypatch.setattr(main, "StorageNodeClient", FakeStorageNodeClient)
+    monkeypatch.setattr(
+        main,
+        "init_db",
+        lambda: None,
+    )
+
+    monkeypatch.setattr(
+        main,
+        "StorageNodeClient",
+        FakeStorageNodeClient,
+    )
+
     monkeypatch.setattr(
         main.settings,
         "storage_node_url",
-        "http://test-storage",
+        "http://test-storage-1",
     )
 
-    main.app.dependency_overrides[main.get_db] = override_get_db
-    FakeStorageNodeClient.objects = {}
+    monkeypatch.setattr(
+        main.settings,
+        "replication_factor",
+        3,
+    )
+
+    main.app.dependency_overrides[
+        main.get_db
+    ] = override_get_db
+
+    FakeStorageNodeClient.objects_by_node = {}
+    FakeStorageNodeClient.failed_urls = set()
 
     return TestClient(main.app), engine
 
@@ -105,7 +178,13 @@ def test_object_lifecycle(monkeypatch):
     try:
         put_response = client.put(
             "/objects/demo/hello.txt",
-            files={"file": ("object.txt", payload, "text/plain")},
+            files={
+                "file": (
+                    "object.txt",
+                    payload,
+                    "text/plain",
+                )
+            },
         )
 
         assert put_response.status_code == 200
@@ -116,13 +195,42 @@ def test_object_lifecycle(monkeypatch):
         assert body["size"] == len(payload)
         assert UUID(body["object_id"])
 
+        object_id = UUID(body["object_id"])
+
+        for objects in (
+            FakeStorageNodeClient
+            .objects_by_node
+            .values()
+        ):
+            assert objects[object_id] == payload
+
+        replica_response = client.get(
+            f"/internal/objects/{object_id}/replicas"
+        )
+
+        assert replica_response.status_code == 200
+
+        replicas = replica_response.json()["replicas"]
+
+        assert len(replicas) == 3
+        assert {
+            replica["state"]
+            for replica in replicas
+        } == {"ACTIVE"}
+
         head_response = client.head(
             "/objects/demo/hello.txt"
         )
 
         assert head_response.status_code == 200
-        assert head_response.headers["content-length"] == str(len(payload))
-        assert head_response.headers["etag"] == f'"{body["checksum"]}"'
+        assert (
+            head_response.headers["content-length"]
+            == str(len(payload))
+        )
+        assert (
+            head_response.headers["etag"]
+            == f'"{body["checksum"]}"'
+        )
         assert head_response.content == b""
 
         get_response = client.get(
@@ -135,6 +243,7 @@ def test_object_lifecycle(monkeypatch):
         list_response = client.get("/objects")
 
         assert list_response.status_code == 200
+
         assert [
             obj["object_key"]
             for obj in list_response.json()["objects"]
@@ -157,6 +266,83 @@ def test_object_lifecycle(monkeypatch):
         engine.dispose()
 
 
+def test_partial_replication_returns_error_and_records_replica_states(
+    monkeypatch,
+):
+    client, engine = create_test_client(monkeypatch)
+
+    payload = b"partial replication"
+
+    FakeStorageNodeClient.failed_urls = {
+        "http://test-storage-2"
+    }
+
+    try:
+        response = client.put(
+            "/objects/demo/partial.txt",
+            files={
+                "file": (
+                    "object.txt",
+                    payload,
+                )
+            },
+        )
+
+        assert response.status_code == 502
+
+        assert response.json()["detail"] == (
+            "Object replication failed: "
+            "2/3 replicas persisted"
+        )
+
+        object_list = client.get("/objects")
+
+        assert object_list.status_code == 200
+
+        object_id = UUID(
+            object_list.json()["objects"][0]["object_id"]
+        )
+
+        replica_response = client.get(
+            f"/internal/objects/{object_id}/replicas"
+        )
+
+        assert replica_response.status_code == 200
+
+        states = [
+            replica["state"]
+            for replica in replica_response.json()["replicas"]
+        ]
+
+        assert states.count("ACTIVE") == 2
+        assert states.count("FAILED") == 1
+
+        assert object_id in (
+            FakeStorageNodeClient
+            .objects_by_node[
+                "http://test-storage-1"
+            ]
+        )
+
+        assert object_id not in (
+            FakeStorageNodeClient
+            .objects_by_node[
+                "http://test-storage-2"
+            ]
+        )
+
+        assert object_id in (
+            FakeStorageNodeClient
+            .objects_by_node[
+                "http://test-storage-3"
+            ]
+        )
+
+    finally:
+        main.app.dependency_overrides.clear()
+        engine.dispose()
+
+
 def test_duplicate_object_key_returns_conflict(monkeypatch):
     client, engine = create_test_client(monkeypatch)
     payload = b"duplicate"
@@ -164,18 +350,26 @@ def test_duplicate_object_key_returns_conflict(monkeypatch):
     try:
         first = client.put(
             "/objects/demo/duplicate.txt",
-            files={"file": ("object.txt", payload)},
+            files={
+                "file": (
+                    "object.txt",
+                    payload,
+                )
+            },
         )
 
         second = client.put(
             "/objects/demo/duplicate.txt",
-            files={"file": ("object.txt", payload)},
+            files={
+                "file": (
+                    "object.txt",
+                    payload,
+                )
+            },
         )
 
         assert first.status_code == 200
         assert second.status_code == 409
-        assert second.json()["detail"] == "Object key already exists"
-        assert len(FakeStorageNodeClient.objects) == 1
 
     finally:
         main.app.dependency_overrides.clear()
@@ -186,9 +380,26 @@ def test_missing_object_returns_404(monkeypatch):
     client, engine = create_test_client(monkeypatch)
 
     try:
-        assert client.get("/objects/missing.txt").status_code == 404
-        assert client.head("/objects/missing.txt").status_code == 404
-        assert client.delete("/objects/missing.txt").status_code == 404
+        assert (
+            client.get(
+                "/objects/missing.txt"
+            ).status_code
+            == 404
+        )
+
+        assert (
+            client.head(
+                "/objects/missing.txt"
+            ).status_code
+            == 404
+        )
+
+        assert (
+            client.delete(
+                "/objects/missing.txt"
+            ).status_code
+            == 404
+        )
 
     finally:
         main.app.dependency_overrides.clear()

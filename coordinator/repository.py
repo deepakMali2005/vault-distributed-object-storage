@@ -93,7 +93,10 @@ class StorageNodeRepository:
         capacity_bytes: int | None = None,
         used_bytes: int | None = None,
     ) -> StorageNode:
-        statement = select(StorageNode).where(StorageNode.url == url)
+        statement = select(StorageNode).where(
+            StorageNode.url == url
+        )
+
         node = self.db.scalar(statement)
 
         if node is None:
@@ -117,7 +120,10 @@ class StorageNodeRepository:
         return node
 
     def list_all(self) -> list[StorageNode]:
-        statement = select(StorageNode).order_by(StorageNode.name)
+        statement = select(StorageNode).order_by(
+            StorageNode.name
+        )
+
         return list(self.db.scalars(statement).all())
 
     def list_active(self) -> list[StorageNode]:
@@ -163,7 +169,56 @@ class ObjectReplicaRepository:
 
         return replica
 
-    def list_for_object(self, object_id: UUID) -> list[ObjectReplica]:
+    def create_many(
+        self,
+        *,
+        object_id: UUID,
+        node_ids: list[UUID],
+        state: str = "PENDING",
+    ) -> list[ObjectReplica]:
+        replicas = [
+            ObjectReplica(
+                object_id=object_id,
+                node_id=node_id,
+                state=state,
+            )
+            for node_id in node_ids
+        ]
+
+        self.db.add_all(replicas)
+        self.db.commit()
+
+        for replica in replicas:
+            self.db.refresh(replica)
+
+        return replicas
+
+    def update_state(
+        self,
+        replica_id: UUID,
+        state: str,
+    ) -> ObjectReplica:
+        replica = self.db.get(
+            ObjectReplica,
+            replica_id,
+        )
+
+        if replica is None:
+            raise ValueError(
+                f"Replica not found: {replica_id}"
+            )
+
+        replica.state = state
+
+        self.db.commit()
+        self.db.refresh(replica)
+
+        return replica
+
+    def list_for_object(
+        self,
+        object_id: UUID,
+    ) -> list[ObjectReplica]:
         statement = (
             select(ObjectReplica)
             .where(ObjectReplica.object_id == object_id)
@@ -173,7 +228,9 @@ class ObjectReplicaRepository:
             )
         )
 
-        return list(self.db.scalars(statement).all())
+        return list(
+            self.db.scalars(statement).all()
+        )
 
     def list_active_for_object(
         self,
@@ -191,4 +248,6 @@ class ObjectReplicaRepository:
             )
         )
 
-        return list(self.db.scalars(statement).all())
+        return list(
+            self.db.scalars(statement).all()
+        )

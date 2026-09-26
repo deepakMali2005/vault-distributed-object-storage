@@ -2,23 +2,28 @@
 
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
-from uuid import uuid4
+from hashlib import sha256
+from tempfile import SpooledTemporaryFile
+from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, status
 from fastapi.responses import Response, StreamingResponse
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from coordinator.config import settings
 from coordinator.db import get_db, init_db
+from coordinator.placement import PlacementError, select_replicas
 from coordinator.repository import (
     ObjectNotFoundError,
+    ObjectReplicaRepository,
     ObjectRepository,
     StorageNodeRepository,
 )
 from coordinator.schemas import (
     ObjectListResponse,
     ObjectMetadataResponse,
+    ObjectReplicaListResponse,
+    ObjectReplicaResponse,
     StorageNodeListResponse,
     StorageNodeResponse,
 )
@@ -59,6 +64,93 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+def _buffer_upload(file: UploadFile) -> tuple[SpooledTemporaryFile, int, str]:
+    """Buffer an upload into a rewindable temporary stream and calculate its checksum."""
+
+    buffered = SpooledTemporaryFile(
+        max_size=8 * 1024 * 1024,
+        mode="w+b",
+    )
+    digest = sha256()
+    size = 0
+
+    try:
+        while True:
+            chunk = file.file.read(1024 * 1024)
+
+            if not chunk:
+                break
+
+            buffered.write(chunk)
+            digest.update(chunk)
+            size += len(chunk)
+
+        buffered.seek(0)
+
+        return buffered, size, digest.hexdigest()
+
+    except Exception:
+        buffered.close()
+        raise
+
+
+def _write_replicas(
+    *,
+    object_id: UUID,
+    buffered: SpooledTemporaryFile,
+    selected_nodes,
+    replica_records,
+    expected_size: int,
+    expected_checksum: str,
+    replica_repository: ObjectReplicaRepository,
+) -> int:
+    """Write an object to every planned replica and persist each result state."""
+
+    successful_writes = 0
+
+    for node, replica in zip(
+        selected_nodes,
+        replica_records,
+        strict=True,
+    ):
+        client = StorageNodeClient(node.url)
+
+        try:
+            buffered.seek(0)
+
+            result = client.put_object(
+                object_id,
+                buffered,
+            )
+
+            if (
+                result.get("size") != expected_size
+                or result.get("checksum") != expected_checksum
+            ):
+                raise StorageNodeError(
+                    "Storage node returned object metadata that does not match "
+                    "the uploaded object"
+                )
+
+            replica_repository.update_state(
+                replica.replica_id,
+                "ACTIVE",
+            )
+
+            successful_writes += 1
+
+        except StorageNodeError:
+            replica_repository.update_state(
+                replica.replica_id,
+                "FAILED",
+            )
+
+        finally:
+            client.close()
+
+    return successful_writes
+
+
 @app.put(
     "/objects/{object_key:path}",
     response_model=ObjectMetadataResponse,
@@ -74,10 +166,12 @@ def put_object(
             detail="Object key cannot be empty",
         )
 
-    repository = ObjectRepository(db)
+    object_repository = ObjectRepository(db)
+    replica_repository = ObjectReplicaRepository(db)
+    node_repository = StorageNodeRepository(db)
 
     try:
-        repository.get_by_key(object_key)
+        object_repository.get_by_key(object_key)
     except ObjectNotFoundError:
         pass
     else:
@@ -87,58 +181,63 @@ def put_object(
         )
 
     object_id = uuid4()
-    client = StorageNodeClient(settings.storage_node_url)
+
+    active_nodes = node_repository.list_active()
 
     try:
-        result = client.put_object(
+        selected_nodes = select_replicas(
             object_id,
-            file.file,
-            file.filename,
-            file.content_type,
+            active_nodes,
+            settings.replication_factor,
         )
-    except StorageNodeError as exc:
+    except PlacementError as exc:
         raise HTTPException(
-            status_code=502,
+            status_code=503,
             detail=str(exc),
         ) from exc
+
+    try:
+        buffered, size, checksum = _buffer_upload(file)
     finally:
-        client.close()
         file.file.close()
 
     try:
-        metadata = repository.create(
+        metadata = object_repository.create(
             object_id=object_id,
             object_key=object_key,
-            size=result["size"],
-            checksum=result["checksum"],
+            size=size,
+            checksum=checksum,
         )
-    except IntegrityError as exc:
-        db.rollback()
-        cleanup = StorageNodeClient(settings.storage_node_url)
 
-        try:
-            cleanup.delete_object(object_id)
-        except StorageNodeError:
-            pass
-        finally:
-            cleanup.close()
+        replica_records = replica_repository.create_many(
+            object_id=object_id,
+            node_ids=[
+                node.node_id
+                for node in selected_nodes
+            ],
+        )
 
+        successful_writes = _write_replicas(
+            object_id=object_id,
+            buffered=buffered,
+            selected_nodes=selected_nodes,
+            replica_records=replica_records,
+            expected_size=size,
+            expected_checksum=checksum,
+            replica_repository=replica_repository,
+        )
+
+    finally:
+        buffered.close()
+
+    if successful_writes != len(selected_nodes):
         raise HTTPException(
-            status_code=409,
-            detail="Object key already exists",
-        ) from exc
-    except Exception:
-        db.rollback()
-        cleanup = StorageNodeClient(settings.storage_node_url)
-
-        try:
-            cleanup.delete_object(object_id)
-        except StorageNodeError:
-            pass
-        finally:
-            cleanup.close()
-
-        raise
+            status_code=502,
+            detail=(
+                "Object replication failed: "
+                f"{successful_writes}/{len(selected_nodes)} replicas persisted"
+            ),
+        )
 
     return ObjectMetadataResponse.model_validate(metadata)
 
@@ -148,10 +247,10 @@ def get_object(
     object_key: str,
     db: Session = Depends(get_db),
 ) -> StreamingResponse:
-    repository = ObjectRepository(db)
+    object_repository = ObjectRepository(db)
 
     try:
-        metadata = repository.get_by_key(object_key)
+        metadata = object_repository.get_by_key(object_key)
     except ObjectNotFoundError as exc:
         raise HTTPException(
             status_code=404,
@@ -182,10 +281,10 @@ def head_object(
     object_key: str,
     db: Session = Depends(get_db),
 ) -> Response:
-    repository = ObjectRepository(db)
+    object_repository = ObjectRepository(db)
 
     try:
-        metadata = repository.get_by_key(object_key)
+        metadata = object_repository.get_by_key(object_key)
     except ObjectNotFoundError as exc:
         raise HTTPException(
             status_code=404,
@@ -209,10 +308,10 @@ def delete_object(
     object_key: str,
     db: Session = Depends(get_db),
 ) -> None:
-    repository = ObjectRepository(db)
+    object_repository = ObjectRepository(db)
 
     try:
-        metadata = repository.get_by_key(object_key)
+        metadata = object_repository.get_by_key(object_key)
     except ObjectNotFoundError as exc:
         raise HTTPException(
             status_code=404,
@@ -231,7 +330,7 @@ def delete_object(
     finally:
         client.close()
 
-    repository.delete(metadata.object_id)
+    object_repository.delete(metadata.object_id)
 
 
 @app.get(
@@ -241,12 +340,12 @@ def delete_object(
 def list_objects(
     db: Session = Depends(get_db),
 ) -> ObjectListResponse:
-    repository = ObjectRepository(db)
+    object_repository = ObjectRepository(db)
 
     return ObjectListResponse(
         objects=[
             ObjectMetadataResponse.model_validate(obj)
-            for obj in repository.list_all()
+            for obj in object_repository.list_all()
         ]
     )
 
@@ -258,11 +357,7 @@ def list_objects(
 def list_storage_nodes(
     db: Session = Depends(get_db),
 ) -> StorageNodeListResponse:
-    """Return storage nodes known to the coordinator.
-
-    This is an internal control-plane endpoint, not part of the public
-    object-storage API.
-    """
+    """Return storage nodes known to the coordinator."""
 
     repository = StorageNodeRepository(db)
 
@@ -270,5 +365,25 @@ def list_storage_nodes(
         nodes=[
             StorageNodeResponse.model_validate(node)
             for node in repository.list_all()
+        ]
+    )
+
+
+@app.get(
+    "/internal/objects/{object_id}/replicas",
+    response_model=ObjectReplicaListResponse,
+)
+def list_object_replicas(
+    object_id: UUID,
+    db: Session = Depends(get_db),
+) -> ObjectReplicaListResponse:
+    """Return replica state for an object."""
+
+    repository = ObjectReplicaRepository(db)
+
+    return ObjectReplicaListResponse(
+        replicas=[
+            ObjectReplicaResponse.model_validate(replica)
+            for replica in repository.list_for_object(object_id)
         ]
     )
