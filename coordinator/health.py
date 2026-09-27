@@ -13,6 +13,7 @@ from coordinator.repository import ObjectReplicaRepository, StorageNodeRepositor
 
 ACTIVE = "ACTIVE"
 FAILED = "FAILED"
+DECOMMISSIONED = "DECOMMISSIONED"
 
 
 class StorageNodeHealthChecker:
@@ -64,6 +65,13 @@ class StorageNodeHealthChecker:
             replica_repository = ObjectReplicaRepository(db)
 
             for node in nodes:
+                if node.status == DECOMMISSIONED:
+                    # Decommissioning is an explicit membership decision, not
+                    # a liveness state. A reachable decommissioned node must
+                    # remain excluded from placement until it is re-registered.
+                    results[str(node.node_id)] = False
+                    continue
+
                 previous_status = node.status
                 healthy = self.check_node(node.url)
                 results[str(node.node_id)] = healthy

@@ -93,6 +93,8 @@ class StorageNodeRepository:
         capacity_bytes: int | None = None,
         used_bytes: int | None = None,
     ) -> StorageNode:
+        url = url.rstrip("/")
+
         url_statement = select(StorageNode).where(
             StorageNode.url == url
         )
@@ -126,7 +128,12 @@ class StorageNodeRepository:
         else:
             node.name = name
             node.url = url
-            node.status = status
+
+            # A deliberately decommissioned node must not be resurrected
+            # merely because its old URL is still present in configuration.
+            if node.status != "DECOMMISSIONED":
+                node.status = status
+
             node.capacity_bytes = capacity_bytes
             node.used_bytes = used_bytes
 
@@ -150,6 +157,62 @@ class StorageNodeRepository:
         )
 
         return list(self.db.scalars(statement).all())
+
+    def list_decommissioned(self) -> list[StorageNode]:
+        statement = (
+            select(StorageNode)
+            .where(StorageNode.status == "DECOMMISSIONED")
+            .order_by(StorageNode.name)
+        )
+
+        return list(self.db.scalars(statement).all())
+
+    def register(
+        self,
+        *,
+        name: str,
+        url: str,
+        capacity_bytes: int | None = None,
+        used_bytes: int | None = None,
+    ) -> StorageNode:
+        """Explicitly register a node as ACTIVE.
+
+        A decommissioned node must not be silently reactivated. A future
+        rejoin can use a new registration identity instead of bypassing the
+        decommissioning lifecycle.
+        """
+
+        normalized_url = url.rstrip("/")
+        existing_by_url = self.db.scalar(
+            select(StorageNode).where(StorageNode.url == normalized_url)
+        )
+        existing_by_name = self.db.scalar(
+            select(StorageNode).where(StorageNode.name == name)
+        )
+
+        if (
+            existing_by_url is not None
+            and existing_by_name is not None
+            and existing_by_url.node_id != existing_by_name.node_id
+        ):
+            raise ValueError(
+                "Storage node name and URL already belong to different nodes"
+            )
+
+        existing = existing_by_url or existing_by_name
+
+        if existing is not None and existing.status == "DECOMMISSIONED":
+            raise ValueError(
+                "A decommissioned storage node cannot be reactivated"
+            )
+
+        return self.upsert(
+            name=name,
+            url=normalized_url,
+            status="ACTIVE",
+            capacity_bytes=capacity_bytes,
+            used_bytes=used_bytes,
+        )
 
     def update_status(
         self,

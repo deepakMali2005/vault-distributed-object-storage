@@ -18,6 +18,7 @@ from coordinator.health import StorageNodeHealthChecker, run_health_monitor
 from coordinator.placement import PlacementError, select_replicas
 from coordinator.repair import ReplicaRepairService
 from coordinator.reconciliation import ReconciliationService
+from coordinator.rebalancing import RebalancingService
 from coordinator.repository import (
     ObjectNotFoundError,
     ObjectReplicaRepository,
@@ -35,7 +36,10 @@ from coordinator.schemas import (
     PhysicalOrphanResponse,
     ReconciliationResultListResponse,
     ReconciliationResultResponse,
+    RebalanceResultListResponse,
+    RebalanceResultResponse,
     StorageNodeListResponse,
+    StorageNodeRegistrationRequest,
     StorageNodeResponse,
     UnderReplicatedObjectListResponse,
     UnderReplicatedObjectResponse,
@@ -738,6 +742,64 @@ def list_storage_nodes(
     )
 
 
+@app.post(
+    "/internal/storage-nodes",
+    response_model=StorageNodeResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def register_storage_node(
+    request: StorageNodeRegistrationRequest,
+    db: Session = Depends(get_db),
+) -> StorageNodeResponse:
+    """Explicitly register a new ACTIVE storage node."""
+
+    repository = StorageNodeRepository(db)
+
+    try:
+        node = repository.register(
+            name=request.name,
+            url=request.url,
+            capacity_bytes=request.capacity_bytes,
+            used_bytes=request.used_bytes,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=str(exc),
+        ) from exc
+
+    return StorageNodeResponse.model_validate(node)
+
+
+@app.post(
+    "/internal/storage-nodes/{node_id}/decommission",
+    response_model=StorageNodeResponse,
+)
+def decommission_storage_node(
+    node_id: UUID,
+    db: Session = Depends(get_db),
+) -> StorageNodeResponse:
+    """Mark a node as intentionally removed from placement."""
+
+    repository = StorageNodeRepository(db)
+
+    try:
+        node = repository.get_by_id(node_id)
+    except StorageNodeNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail="Storage node not found",
+        ) from exc
+
+    if node.status != "DECOMMISSIONED":
+        node = repository.update_status(
+            node_id,
+            "DECOMMISSIONED",
+        )
+
+    return StorageNodeResponse.model_validate(node)
+
+
 @app.get(
     "/internal/objects/{object_id}/replicas",
     response_model=ObjectReplicaListResponse,
@@ -811,6 +873,35 @@ def repair_under_replicated_objects() -> RepairResultListResponse:
                 remaining_missing_replicas=result.remaining_missing_replicas,
             )
             for result in service.repair_all()
+        ]
+    )
+
+
+@app.post(
+    "/internal/rebalance",
+    response_model=RebalanceResultListResponse,
+)
+def rebalance_storage() -> RebalanceResultListResponse:
+    """Rebalance objects after membership or replication-policy changes."""
+
+    service = RebalancingService(
+        SessionLocal,
+        replication_factor=settings.replication_factor,
+    )
+
+    return RebalanceResultListResponse(
+        results=[
+            RebalanceResultResponse(
+                object_id=result.object_id,
+                object_key=result.object_key,
+                desired_node_ids=list(result.desired_node_ids),
+                healthy_node_ids=list(result.healthy_node_ids),
+                migrated_node_ids=list(result.migrated_node_ids),
+                removed_node_ids=list(result.removed_node_ids),
+                failed_node_ids=list(result.failed_node_ids),
+                unavailable_node_ids=list(result.unavailable_node_ids),
+            )
+            for result in service.rebalance_all()
         ]
     )
 

@@ -46,6 +46,34 @@ class StorageNodeListResponse(BaseModel):
     nodes: list[StorageNodeResponse]
 
 
+class StorageNodeRegistrationRequest(BaseModel):
+    """Request to explicitly register a new storage node."""
+
+    name: str
+    url: str
+    capacity_bytes: int | None = None
+    used_bytes: int | None = None
+
+
+class RebalanceResultResponse(BaseModel):
+    """Result of rebalancing one object."""
+
+    object_id: UUID
+    object_key: str
+    desired_node_ids: list[UUID]
+    healthy_node_ids: list[UUID]
+    migrated_node_ids: list[UUID]
+    removed_node_ids: list[UUID]
+    failed_node_ids: list[UUID]
+    unavailable_node_ids: list[UUID]
+
+
+class RebalanceResultListResponse(BaseModel):
+    """Response containing object rebalancing results."""
+
+    results: list[RebalanceResultResponse]
+
+
 class ObjectReplicaResponse(BaseModel):
     """Internal metadata describing one object replica."""
 
