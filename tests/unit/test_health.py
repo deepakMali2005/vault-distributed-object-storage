@@ -51,6 +51,8 @@ def test_health_checker_marks_unreachable_node_failed(monkeypatch):
 
             assert node is not None
             assert node.status == FAILED
+            assert checker.newly_failed_node_ids == (node_id,)
+            assert checker.recovered_node_ids == ()
     finally:
         engine.dispose()
 
@@ -126,6 +128,42 @@ def test_health_checker_marks_replicas_failed_for_unreachable_node(
         engine.dispose()
 
 
+def test_health_checker_reports_new_failure_only_on_active_to_failed_transition(
+    monkeypatch,
+):
+    engine, factory = create_session_factory()
+
+    try:
+        with factory() as db:
+            repository = StorageNodeRepository(db)
+            node = repository.upsert(
+                name="storage-node-1",
+                url="http://test-storage-1",
+                status=ACTIVE,
+            )
+            node_id = node.node_id
+
+        checker = StorageNodeHealthChecker(factory)
+
+        monkeypatch.setattr(
+            checker,
+            "check_node",
+            lambda _url: False,
+        )
+
+        checker.check_all_nodes()
+
+        assert checker.newly_failed_node_ids == (node_id,)
+        assert checker.recovered_node_ids == ()
+
+        checker.check_all_nodes()
+
+        assert checker.newly_failed_node_ids == ()
+        assert checker.recovered_node_ids == ()
+    finally:
+        engine.dispose()
+
+
 def test_health_checker_recovers_failed_node(monkeypatch):
     engine, factory = create_session_factory()
 
@@ -159,6 +197,41 @@ def test_health_checker_recovers_failed_node(monkeypatch):
 
             assert node is not None
             assert node.status == ACTIVE
+            assert checker.recovered_node_ids == (node_id,)
+            assert checker.newly_failed_node_ids == ()
+    finally:
+        engine.dispose()
+
+
+def test_health_checker_reports_recovery_only_once(monkeypatch):
+    engine, factory = create_session_factory()
+
+    try:
+        with factory() as db:
+            repository = StorageNodeRepository(db)
+
+            node = repository.upsert(
+                name="storage-node-1",
+                url="http://test-storage-1",
+                status=FAILED,
+            )
+
+            node_id = node.node_id
+
+        checker = StorageNodeHealthChecker(factory)
+
+        monkeypatch.setattr(
+            checker,
+            "check_node",
+            lambda _url: True,
+        )
+
+        checker.check_all_nodes()
+        assert checker.recovered_node_ids == (node_id,)
+
+        checker.check_all_nodes()
+        assert checker.recovered_node_ids == ()
+        assert checker.newly_failed_node_ids == ()
     finally:
         engine.dispose()
 

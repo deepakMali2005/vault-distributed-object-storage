@@ -17,6 +17,7 @@ from coordinator.db import SessionLocal, get_db, init_db
 from coordinator.health import StorageNodeHealthChecker, run_health_monitor
 from coordinator.placement import PlacementError, select_replicas
 from coordinator.repair import ReplicaRepairService
+from coordinator.reconciliation import ReconciliationService
 from coordinator.repository import (
     ObjectNotFoundError,
     ObjectReplicaRepository,
@@ -31,6 +32,9 @@ from coordinator.schemas import (
     ObjectReplicaResponse,
     RepairResultListResponse,
     RepairResultResponse,
+    PhysicalOrphanResponse,
+    ReconciliationResultListResponse,
+    ReconciliationResultResponse,
     StorageNodeListResponse,
     StorageNodeResponse,
     UnderReplicatedObjectListResponse,
@@ -69,25 +73,28 @@ async def lifespan(_app: FastAPI):
     )
 
     def repair_after_health_check() -> None:
-        """Repair objects after health checks when a node is unavailable."""
+        """Repair new failures and synchronize nodes that have recovered."""
 
-        with SessionLocal() as health_db:
-            nodes = StorageNodeRepository(
-                health_db
-            ).list_all()
+        if health_checker.newly_failed_node_ids:
+            ReplicaRepairService(
+                SessionLocal,
+                replication_factor=settings.replication_factor,
+            ).repair_all()
 
-            has_failed_node = any(
-                node.status == "FAILED"
-                for node in nodes
-            )
+        recovered_node_ids = health_checker.recovered_node_ids
 
-        if not has_failed_node:
+        if not recovered_node_ids:
             return
 
-        ReplicaRepairService(
+        reconciliation_service = ReconciliationService(
             SessionLocal,
             replication_factor=settings.replication_factor,
-        ).repair_all()
+        )
+
+        for node_id in recovered_node_ids:
+            reconciliation_service.synchronize_recovered_node(
+                node_id
+            )
 
     health_task = asyncio.create_task(
         run_health_monitor(
@@ -805,6 +812,49 @@ def repair_under_replicated_objects() -> RepairResultListResponse:
             )
             for result in service.repair_all()
         ]
+    )
+
+
+@app.post(
+    "/internal/reconcile",
+    response_model=ReconciliationResultListResponse,
+)
+def reconcile_storage() -> ReconciliationResultListResponse:
+    """Reconcile physical storage with current coordinator placement."""
+
+    service = ReconciliationService(
+        SessionLocal,
+        replication_factor=settings.replication_factor,
+    )
+
+    results = service.reconcile_all()
+
+    return ReconciliationResultListResponse(
+        results=[
+            ReconciliationResultResponse(
+                object_id=result.object_id,
+                object_key=result.object_key,
+                desired_node_ids=list(result.desired_node_ids),
+                healthy_node_ids=list(result.healthy_node_ids),
+                repaired_node_ids=list(result.repaired_node_ids),
+                removed_node_ids=list(result.removed_node_ids),
+                stale_node_ids=list(result.stale_node_ids),
+                missing_node_ids=list(result.missing_node_ids),
+                checksum_mismatch_node_ids=list(
+                    result.checksum_mismatch_node_ids
+                ),
+                orphan_node_ids=list(result.orphan_node_ids),
+                unavailable_node_ids=list(result.unavailable_node_ids),
+            )
+            for result in results
+        ],
+        orphan_objects=[
+            PhysicalOrphanResponse(
+                object_id=orphan.object_id,
+                node_id=orphan.node_id,
+            )
+            for orphan in service.find_orphan_objects()
+        ],
     )
 
 

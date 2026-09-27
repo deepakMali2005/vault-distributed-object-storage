@@ -16,6 +16,8 @@ class StorageNodeError(Exception):
         *,
         status_code: int | None = None,
     ) -> None:
+        """Store the failure message and optional HTTP status code."""
+
         super().__init__(message)
         self.status_code = status_code
 
@@ -24,10 +26,14 @@ class StorageNodeClient:
     """Client used by the coordinator to communicate with a storage node."""
 
     def __init__(self, base_url: str) -> None:
+        """Create an HTTP client for one storage node."""
+
         self.base_url = base_url.rstrip("/")
         self.client = httpx.Client(timeout=60.0)
 
     def close(self) -> None:
+        """Close the underlying HTTP connection pool."""
+
         self.client.close()
 
     def put_object(
@@ -37,6 +43,8 @@ class StorageNodeClient:
         filename: str | None = None,
         content_type: str | None = None,
     ) -> dict:
+        """Upload an object to the storage node."""
+
         files = {
             "file": (
                 filename or str(object_id),
@@ -70,6 +78,8 @@ class StorageNodeClient:
         self,
         object_id: UUID,
     ) -> Iterator[httpx.Response]:
+        """Stream an object's bytes from the storage node."""
+
         try:
             with self.client.stream(
                 "GET",
@@ -95,7 +105,12 @@ class StorageNodeClient:
                 f"Storage node GET failed: {exc}"
             ) from exc
 
-    def head_object(self, object_id: UUID) -> httpx.Response:
+    def head_object(
+        self,
+        object_id: UUID,
+    ) -> httpx.Response:
+        """Request object metadata without downloading the object."""
+
         try:
             response = self.client.head(
                 f"{self.base_url}/objects/{object_id}",
@@ -108,6 +123,7 @@ class StorageNodeClient:
 
         if response.status_code == 404:
             response.close()
+
             raise StorageNodeError(
                 "Object not found on storage node",
                 status_code=404,
@@ -116,6 +132,7 @@ class StorageNodeClient:
         if response.is_error:
             status_code = response.status_code
             response.close()
+
             raise StorageNodeError(
                 "Storage node HEAD failed with status "
                 f"{status_code}",
@@ -124,7 +141,47 @@ class StorageNodeClient:
 
         return response
 
-    def delete_object(self, object_id: UUID) -> None:
+    def list_objects(self) -> list[dict]:
+        """Return the physical object inventory reported by a storage node."""
+
+        try:
+            response = self.client.get(
+                f"{self.base_url}/objects",
+            )
+
+            if response.is_error:
+                raise StorageNodeError(
+                    "Storage node inventory failed with status "
+                    f"{response.status_code}",
+                    status_code=response.status_code,
+                )
+
+            payload = response.json()
+
+        except httpx.HTTPError as exc:
+            raise StorageNodeError(
+                f"Storage node inventory failed: {exc}"
+            ) from exc
+
+        finally:
+            if "response" in locals():
+                response.close()
+
+        objects = payload.get("objects")
+
+        if not isinstance(objects, list):
+            raise StorageNodeError(
+                "Storage node inventory response is invalid"
+            )
+
+        return objects
+
+    def delete_object(
+        self,
+        object_id: UUID,
+    ) -> None:
+        """Delete an object from the storage node."""
+
         try:
             response = self.client.delete(
                 f"{self.base_url}/objects/{object_id}",
@@ -137,6 +194,7 @@ class StorageNodeClient:
 
         if response.status_code == 404:
             response.close()
+
             raise StorageNodeError(
                 "Object not found on storage node",
                 status_code=404,
@@ -145,6 +203,7 @@ class StorageNodeClient:
         if response.is_error:
             status_code = response.status_code
             response.close()
+
             raise StorageNodeError(
                 "Storage node DELETE failed with status "
                 f"{status_code}",

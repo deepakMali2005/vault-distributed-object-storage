@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from uuid import UUID
 
 import httpx
 from sqlalchemy.orm import Session
@@ -25,6 +26,8 @@ class StorageNodeHealthChecker:
     ) -> None:
         self.session_factory = session_factory
         self.timeout_seconds = timeout_seconds
+        self.newly_failed_node_ids: tuple[UUID, ...] = ()
+        self.recovered_node_ids: tuple[UUID, ...] = ()
 
     def check_node(self, url: str) -> bool:
         """Return whether a storage node responds successfully to /health."""
@@ -55,10 +58,13 @@ class StorageNodeHealthChecker:
             repository = StorageNodeRepository(db)
             nodes = repository.list_all()
             results: dict[str, bool] = {}
+            newly_failed_node_ids: list[UUID] = []
+            recovered_node_ids: list[UUID] = []
 
             replica_repository = ObjectReplicaRepository(db)
 
             for node in nodes:
+                previous_status = node.status
                 healthy = self.check_node(node.url)
                 results[str(node.node_id)] = healthy
 
@@ -69,10 +75,19 @@ class StorageNodeHealthChecker:
                     status,
                 )
 
+                if previous_status == ACTIVE and not healthy:
+                    newly_failed_node_ids.append(node.node_id)
+
+                if previous_status == FAILED and healthy:
+                    recovered_node_ids.append(node.node_id)
+
                 if not healthy:
                     replica_repository.mark_failed_for_node(
                         node.node_id,
                     )
+
+            self.newly_failed_node_ids = tuple(newly_failed_node_ids)
+            self.recovered_node_ids = tuple(recovered_node_ids)
 
             return results
 

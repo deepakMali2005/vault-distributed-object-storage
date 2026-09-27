@@ -11,3 +11,9 @@ class StoredObject(BaseModel):
     object_id: UUID
     size: int
     checksum: str
+
+
+class StoredObjectListResponse(BaseModel):
+    """Response containing the physical objects stored on a node."""
+
+    objects: list[StoredObject]

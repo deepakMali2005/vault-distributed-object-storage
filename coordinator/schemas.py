@@ -96,3 +96,33 @@ class RepairResultListResponse(BaseModel):
     """Response containing repair results."""
 
     results: list[RepairResultResponse]
+
+
+class PhysicalOrphanResponse(BaseModel):
+    """Physical object that has no corresponding coordinator metadata."""
+
+    object_id: UUID
+    node_id: UUID
+
+
+class ReconciliationResultResponse(BaseModel):
+    """Result of reconciling one object against physical storage."""
+
+    object_id: UUID
+    object_key: str
+    desired_node_ids: list[UUID]
+    healthy_node_ids: list[UUID]
+    repaired_node_ids: list[UUID]
+    removed_node_ids: list[UUID]
+    stale_node_ids: list[UUID]
+    missing_node_ids: list[UUID]
+    checksum_mismatch_node_ids: list[UUID]
+    orphan_node_ids: list[UUID]
+    unavailable_node_ids: list[UUID]
+
+
+class ReconciliationResultListResponse(BaseModel):
+    """Response containing reconciliation results and orphan objects."""
+
+    results: list[ReconciliationResultResponse]
+    orphan_objects: list[PhysicalOrphanResponse]
